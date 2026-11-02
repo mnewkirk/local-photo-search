@@ -95,6 +95,13 @@ FIX_LEAK = ("Rewrite the same description without mentioning the boxes, the numb
             "drawing: describe only the people and the scene, keeping the [words](n) marks. "
             "Answer with the description only.")
 
+CONTEXT_INTRO = ("Who is in the boxes (this is known and correct: use it to describe them "
+                 "accurately, but never write their names):\n")
+
+FIX_NAMES = ("Rewrite the same description without any person's name: describe each person by "
+             "what they look like and do, keeping the [words](n) marks. Answer with the "
+             "description only.")
+
 HINTS_INTRO = ("Known about some boxed people (if what you see clearly disagrees, describe "
                "what you see):\n")
 
@@ -116,8 +123,35 @@ def hint_line(n: int, gender: Optional[str], age: Optional[int]) -> Optional[str
     return f"- box {n}: {', '.join(parts)}" if parts else None
 
 
+def person_noun(gender: Optional[str], age: Optional[int]) -> Optional[str]:
+    """"a boy aged about 10", "a woman", "male": what the context says a box is."""
+    if gender not in ("male", "female"):
+        return age_band(age)
+    if age is not None and age <= 12:
+        return f"a {'boy' if gender == 'male' else 'girl'} aged about {age}"
+    if age is not None and age <= 19:
+        return f"a teenage {'boy' if gender == 'male' else 'girl'}"
+    if age is not None:
+        return "a man" if gender == "male" else "a woman"
+    return gender
+
+
+def context_line(n: int, name: str, gender: Optional[str], age: Optional[int]) -> str:
+    who = person_noun(gender, age)
+    return f"- box {n}: {name}" + (f", {who}" if who else "")
+
+
+def name_in_text(description: str, names: list[str]) -> Optional[str]:
+    """The first roster name (full or any part of 3+ letters) the text uses, else None."""
+    for full in names:
+        for part in {full, *full.replace("'", " ").split()}:
+            if len(part) >= 3 and re.search(r"\b" + re.escape(part) + r"\b", description, re.I):
+                return part
+    return None
+
+
 def build_prompt(n_boxes: int, shape: str = "two", length: bool = True,
-                 hints: Optional[list[str]] = None) -> str:
+                 hints: Optional[list[str]] = None, context: Optional[list[str]] = None) -> str:
     """``shape``: "two" (clean photo + overlay) or "one" (overlay only)."""
     rules = _PHOTO_RULES if shape == "two" else _PHOTO_RULES.replace("the first image", "this photo")
     p = (TWO_IMAGE_HEAD if shape == "two" else ONE_IMAGE_HEAD).format(n=n_boxes) + rules + "\n\n"
@@ -126,19 +160,21 @@ def build_prompt(n_boxes: int, shape: str = "two", length: bool = True,
     p += _MARK_RULES
     if hints:
         p += "\n\n" + HINTS_INTRO + "\n".join(hints)
+    if context:
+        p += "\n\n" + CONTEXT_INTRO + "\n".join(context)
     return p
 
 
 _STRAY_NUM_RE = re.compile(r"\s*\[\s*\d{1,2}(?:\s*[,-]\s*\d{1,2})*\s*\]")
 
 
-def strip_marks(raw: str, n_boxes: int) -> dict:
+def strip_marks(raw: str, n_boxes: int, names: Optional[list[str]] = None) -> dict:
     """Last resort after a corrective retry: drop stray ``[n]`` marks and keep the text
     with NO spans (the photo names nobody). Still raises on leakage or leftover brackets."""
-    return dict(parse(_STRAY_NUM_RE.sub("", raw or ""), n_boxes), spans=[], unanchored=True)
+    return dict(parse(_STRAY_NUM_RE.sub("", raw or ""), n_boxes, names), spans=[], unanchored=True)
 
 
-def parse(raw: str, n_boxes: int) -> dict:
+def parse(raw: str, n_boxes: int, names: Optional[list[str]] = None) -> dict:
     """``{"description", "spans": [{"start", "end", "phrase", "boxes"}], "dropped": [...]}``
     with the markup stripped. An anchor whose parentheses are not 1-3 box numbers in
     1..n is stripped WITHOUT a span (``dropped``): the text stays usable, the mention
@@ -174,4 +210,7 @@ def parse(raw: str, n_boxes: int) -> dict:
     leak = LEAK_RE.search(desc)
     if leak:
         raise UnusableAnswer(f"grounded describe: overlay words: {leak.group(0)!r}")
+    hit = name_in_text(desc, names or [])
+    if hit:
+        raise UnusableAnswer(f"grounded describe: name in text: {hit!r}")
     return {"description": desc, "spans": spans, "dropped": dropped, "degenerate": degenerate(desc, spans)}

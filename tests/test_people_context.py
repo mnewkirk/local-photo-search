@@ -199,3 +199,19 @@ def test_degenerate_marks():
     r = GD.parse("Four of them [a boy](1), [a boy](2) and [a boy](3) stand.", 3)
     assert r["degenerate"]
     assert GD.parse("[A boy in blue](1) kicks while [a girl](2) watches.", 2)["degenerate"] is None
+
+
+def test_names_as_context_are_never_written():
+    p = GD.build_prompt(2, "two", True, context=[GD.context_line(1, "Asa Goldman", "male", 10)])
+    assert "box 1: Asa Goldman, a boy aged about 10" in p and "never write their names" in p
+    with pytest.raises(UnusableAnswer, match="name in text"):
+        GD.parse("[Asa](1) kicks the ball.", 2, ["Asa Goldman"])
+    with pytest.raises(UnusableAnswer, match="name in text"):
+        GD.parse("[The Goldman boy](1) kicks the ball.", 2, ["Asa Goldman"])
+    assert GD.parse("[A boy](1) kicks the ball.", 2, ["Asa Goldman"])["spans"]
+
+
+def test_person_noun():
+    assert GD.person_noun("male", 10) == "a boy aged about 10"
+    assert GD.person_noun("female", 40) == "a woman"
+    assert GD.person_noun("male", None) == "male"

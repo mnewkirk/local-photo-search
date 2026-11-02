@@ -747,6 +747,9 @@ G1_VARIANTS = {
     "two-L-nohints": ("two", True, "none"),
     "two-L-flip": ("two", True, "flip"),        # hint-injection test: the gender hint flipped
     "plain": ("plain", False, "none"),          # today's describe prompt, clean photo only (baseline)
+    # owner decision 2026-11-01: names as context (after the shoot is labelled), never in the text
+    "two-L-names": ("two", True, "names"),
+    "two-L-names-flip": ("two", True, "names-flip"),   # the largest named box's gender flipped
 }
 
 
@@ -785,6 +788,13 @@ def g1_inputs(con, pid, bodies_all, ev):
                                    and bool(row[2] or row[3]))
         out.append(rec)
     return {"description": inp["description"], "targets": out, "W": inp["image_width"], "H": inp["image_height"]}
+
+
+def kp_ok(ev, pid):
+    """Face ids the keypoint check links to a body, uncontested, on this photo."""
+    e = ev.get(pid) or {}
+    con = set(e.get("contested") or [])
+    return {b["face_id"] for b in e.get("bodies", []) if b.get("face_id") and b["face_id"] not in con}
 
 
 def _flip_target(targets):
@@ -827,9 +837,22 @@ def cmd_g1_run(a):
         if not g:
             continue
         tg = g["targets"]
-        flip = _flip_target(tg) if hints_mode == "flip" else None
-        if hints_mode == "flip" and flip is None:
+        flip = _flip_target(tg) if hints_mode in ("flip", "names-flip") else None
+        if hints_mode in ("flip", "names-flip") and flip is None:
             continue
+        context, names = [], []
+        if hints_mode in ("names", "names-flip"):
+            for t in tg:
+                if t["hintable"] or (t["person"] and t["face_id"] in kp_ok(ev, pid)):
+                    nm = con.execute("SELECT name FROM persons WHERE id=?", (t["person"],)).fetchone()[0]
+                    gen = t["gender"]
+                    if t["n"] == flip:
+                        gen = {"male": "female", "female": "male"}.get(gen, gen)
+                    context.append(GD.context_line(t["n"], nm, gen, t["age"]))
+                    names.append(nm)
+            all_names = names          # the guard checks the names the model was told
+        else:
+            all_names = None
         hints = []
         if hints_mode in ("true", "flip"):
             for t in tg:
@@ -846,9 +869,9 @@ def cmd_g1_run(a):
         else:
             overlay = PB.draw_boxes(img, [t["bbox"] for t in tg])
             images = [_clean_b64(img), overlay] if shape == "two" else [overlay]
-            prompt = GD.build_prompt(len(tg), shape, length, hints)
+            prompt = GD.build_prompt(len(tg), shape, length, hints, context)
         t0 = time.time()
-        rec = {"targets": tg, "hints": hints, "flip": flip}
+        rec = {"targets": tg, "hints": hints, "flip": flip, "context": context}
         try:
             raw = D._ollama_chat_with_retry(model=a.model, messages=[{"role": "user", "content": prompt, "images": images}],
                                             role="describe", options={"temperature": 0.0, "num_ctx": 16384})
@@ -874,14 +897,15 @@ def cmd_g1_run(a):
                 rec["error"] = str(e)
         elif raw is not None:
             try:
-                rec.update(GD.parse(raw, len(tg)))
+                rec.update(GD.parse(raw, len(tg), all_names))
             except D.UnusableAnswer as e:
                 rec["error"] = str(e)[:200]
-            if "error" in rec and ("stray markup" in rec["error"] or "overlay words" in rec["error"]):
+            if "error" in rec and any(w in rec["error"] for w in ("stray markup", "overlay words", "name in text")):
                 # One corrective turn (what production would do before failing the photo).
                 msgs = [{"role": "user", "content": prompt, "images": images},
                         {"role": "assistant", "content": raw},
-                        {"role": "user", "content": GD.FIX_MARKUP if "stray" in rec["error"] else GD.FIX_LEAK}]
+                        {"role": "user", "content": (GD.FIX_MARKUP if "stray" in rec["error"] else
+                                                     GD.FIX_NAMES if "name in text" in rec["error"] else GD.FIX_LEAK)}]
                 try:
                     raw2 = D._ollama_chat_with_retry(model=a.model, messages=msgs, role="describe",
                                                      options={"temperature": 0.0, "num_ctx": 16384})
@@ -891,12 +915,12 @@ def cmd_g1_run(a):
                 if raw2:
                     rec["retried"], rec["raw_first"], rec["raw"] = True, raw, raw2
                     try:
-                        rec.update(GD.parse(raw2, len(tg)))
+                        rec.update(GD.parse(raw2, len(tg), all_names))
                         rec.pop("error", None)
                     except D.UnusableAnswer as e:
                         rec["error"] = str(e)[:200]
                         try:
-                            rec.update(GD.strip_marks(raw2, len(tg)))
+                            rec.update(GD.strip_marks(raw2, len(tg), all_names))
                             rec["fallback"] = rec.pop("error")
                         except D.UnusableAnswer:
                             pass

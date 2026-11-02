@@ -83,6 +83,7 @@ validated against the witness labels. The raw `photos.description` stays name-fr
 | Re-describe scope | One soccer shoot pilot (100 renders reviewed, 0 wrong) -> 2026 soccer collections -> decide the rest from measured GPU time | All trusted-label photos after the pilot | **A** | 2026-10-31 |
 
 | Precision bar for names | 0 wrong binds across >= 150 (rule of three) | Owner accepts the measured ~99% precision (152 of 153 owner-verified people-bind binds right), with the overlap checks below | **B** | 2026-11-01 |
+| What describe knows | Boxes only (gender/age hints at most) | Describe runs after the shoot's faces and bodies are set and labelled, and gets each box's identity as context (name, gender, age); it writes name-free text with `[words](n)` marks; a guard rejects a roster name in the text. An assembled text with names is stored as a separate write-once-read-many field, which search and outbound captions can read | **B** (names as context; assembled text stored) | 2026-11-01 |
 
 Dropped after Step 0: running `match_faces` earlier so strict labels reach a batch's first describe: cheap (~30 ms per
 claim on the N100) but useless today (face references exist for 4 people; ~1 unlabelled match per shoot).
@@ -142,3 +143,8 @@ Notes: docs/notes/llm-passes.md, "people context: G0 and G1 evals". Harness: `ev
   pick between two similar players. Dev + holdout 139 / 4 (97.2%).
 - **Scope if holdout holds**: a reduced Step 5-6 (describe writes marks; names only from keypoint-linked
   trusted faces); no `body_attrs` / `body_identity`, no hints, no cue names.
+- **Owner decision 2026-11-01 (supersedes "identity never given to describe as a name")**: describe waits
+  for the shoot's labels and gets names as context; raw text stays name-free (marks -> spans); an
+  assembled, named text is stored separately for search and outbound captions (how those read it, and
+  the relabel rule for the stored copy, to be designed). Next eval: the "names as context" variant on dev.
+
