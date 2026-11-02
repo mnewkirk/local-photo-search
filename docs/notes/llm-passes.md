@@ -1221,7 +1221,8 @@ on the desktop (`--from 2026-08-29 --to 2026-10-25 --camera ILCE-7RM6`: the nine
   most of them.
 - Owner review: 113 slots on 100 random photos that render a name
   (`evals/people_bind_eval.py --set prod-soccer from-db / review-sheet / serve`, port 8765).
-  `PHOTOSEARCH_DISPLAY_DESCRIPTIONS` stays off until the owner has looked.
+  `PHOTOSEARCH_DISPLAY_DESCRIPTIONS` turned on after the review (`3519189`, NAS web + replica; the
+  NAS MCP container stays off).
 
 ### people context: names as describe context (2026-11-01)
 
