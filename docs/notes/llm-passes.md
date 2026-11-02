@@ -1266,3 +1266,20 @@ Plan: docs/plans/people-context-describe-v2.md. Code: the v2 section of `photose
   reminder), so `v2-noctx` measures exactly the unlabelled-shoot prompt; a P0 echo there shows as `foreign`.
 - `FIX_NAMES_V2` (= FIX_NAMES + "Keep every person mark and P-number.") added for a roster name guessed
   into the text; the plan names no turn for it.
+
+### people context v2: Step 2, eval arms (2026-11-01)
+
+Harness: `g1v2-run` / `g1v2-report` in `evals/people_context_eval.py` (a `G1V2_VARIANTS` table beside
+`G1_VARIANTS`: the v1 tuple rows and their run files stay as they are). Run files record `prompt_version`;
+a new prompt needs a new `--suffix`.
+
+- **The draft's form demos used real ids**: `[a boy in a red cap](2:P39)` and `[two men](1,3:P8)`; P39 is
+  Asa Goldman, the person the gender gate tracks. Every demo handle (mark rules, FIX turns, drawn line) is
+  now `P0`, so a copied demo shows as `foreign` and counts as example echo.
+- **Baselines reproduced offline** (dev 125): "girl" on a labelled boy (single-box phrase) 12 no hints,
+  6 names; unusable 0 / 14. `wrong_gender_age` (phrase + window, groups, age) gives 14 / 7 on the
+  same runs; 132 roster-box spans on 109 photos (no hints).
+- Smoke (5 photos, v2-id): 1.9 s/photo; the model wrote P39 on the wrong box twice (`orphan`) and still
+  called Asa "a girl" once on a handle-less mark (`omitted`): the classes the cross-check was built for.
+  The FIX_ROSTER turn fixed its target but repeated a handle on a group.
+- Arms added beyond the plan's list: `v2-id-swap` (the plan's "second flip" as its own run, reported).

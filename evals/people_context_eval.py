@@ -978,7 +978,7 @@ def cmd_g1_sheet(a):
                           "spans": [[sp["start"], sp["end"]] for sp in r["spans"]]})
             for sp in r["spans"]:
                 k = _anchor_key(pid_s, sp)
-                if a.named_only and not sp.get("name_agrees"):
+                if a.named_only and not (sp.get("name_agrees") or sp.get("named")):
                     continue
                 if a.named_only and judged.get(k, {}).get("v") in ("right", "fix", "none", "ambiguous"):
                     continue
@@ -1279,6 +1279,486 @@ if (SERVED) fetch("saved-labels.json", {cache: "no-store"}).then(r => r.status =
 """
 
 
+# --- G1 v2: known people by person-id handle (docs/plans/people-context-describe-v2.md) ---
+
+G1V2_VARIANTS = {
+    # name: arm options (roster sent, handles in the marks, roster placement, handles drawn, flip)
+    "v2-noctx": dict(roster=False),
+    "v2-id": dict(),
+    "v2-box": dict(handles=False),           # code maps box -> person
+    "v2-id-drawn": dict(drawn=True),
+    "v2-id-last": dict(placement="last"),
+    "v2-id-flip": dict(flip="gender"),       # the largest roster entry's gender flipped
+    "v2-id-swap": dict(flip="swap"),         # two entries' boxes swapped (2+-roster photos)
+}
+G1V2_DERIVED = ("v2-id-fixroster", "v2-id-ovl")      # extra calls on v2-id answers, no new describe
+ECHO_RE = re.compile(r"\b(gr[ea]y coat|umbrella|bus stop)\b", re.I)
+_LIVE_SQL = ("SELECT person_id FROM faces WHERE photo_id=? AND person_id IS NOT NULL "
+             "AND COALESCE(match_source, '') NOT IN ('rejected', 'dedupe_unmatched')")
+
+
+def v2_roster(con, pid, g, ev):
+    """``{box: entry}`` for the known people (plan, "Roster rules"): a target whose trusted
+    face the keypoint check links to its body, uncontested, and whose person owns no
+    second live face in the photo."""
+    ok = kp_ok(ev, pid)
+    owners = Counter(r[0] for r in con.execute(_LIVE_SQL, (pid,)))
+    roster = {}
+    for t in g["targets"]:
+        if not t["person"] or t["face_id"] not in ok or owners[t["person"]] > 1:
+            continue
+        src, name = con.execute("SELECT f.match_source, pe.name FROM faces f JOIN persons pe ON pe.id = f.person_id "
+                                "WHERE f.id = ?", (t["face_id"],)).fetchone()
+        if src not in TRUSTED:
+            continue
+        roster[t["n"]] = {"person_id": t["person"], "face_id": t["face_id"], "body_bbox": t["bbox"],
+                          "label_source": src, "gender": t["gender"], "age": t["age"], "name": name}
+    return roster
+
+
+def _area_of(b):
+    return (b[2] - b[0]) * (b[1] - b[3])
+
+
+def v2_sent_roster(roster, flip):
+    """The roster as sent: unchanged, or with the largest gendered entry's gender flipped
+    ("gender"), or the two largest entries swapped between their boxes ("swap"). None when
+    the photo has no entry the flip can act on."""
+    sent = {b: dict(e, gender_sent=e["gender"], flipped=False) for b, e in roster.items()}
+    if flip == "gender":
+        gs = [b for b, e in roster.items() if e["gender"] in ("male", "female")]
+        if not gs:
+            return None
+        b = max(gs, key=lambda b: _area_of(roster[b]["body_bbox"]))
+        sent[b]["gender"] = sent[b]["gender_sent"] = {"male": "female", "female": "male"}[roster[b]["gender"]]
+        sent[b]["flipped"] = True
+    elif flip == "swap":
+        if len(roster) < 2:
+            return None
+        b1, b2 = sorted(roster, key=lambda b: -_area_of(roster[b]["body_bbox"]))[:2]
+        keep = ("body_bbox",)
+        sent[b1] = dict({k: v for k, v in roster[b2].items() if k not in keep}, body_bbox=roster[b1]["body_bbox"],
+                        gender_sent=roster[b2]["gender"], flipped="swap")
+        sent[b2] = dict({k: v for k, v in roster[b1].items() if k not in keep}, body_bbox=roster[b2]["body_bbox"],
+                        gender_sent=roster[b1]["gender"], flipped="swap")
+    return sent
+
+
+def _v2_fix_for(err, handles):
+    from photosearch import grounded_describe as GD
+    if "stray markup" in err:
+        return "markup", GD.FIX_MARKUP_V2 if handles else GD.FIX_MARKUP
+    if "id in text" in err:
+        return "ids", GD.FIX_IDS if handles else GD.FIX_LEAK
+    if "overlay words" in err:
+        return "leak", GD.FIX_LEAK_V2 if handles else GD.FIX_LEAK
+    if "name in text" in err:
+        return "names", GD.FIX_NAMES_V2 if handles else GD.FIX_NAMES
+    return None, None
+
+
+def _v2_chat(model, msgs):
+    from photosearch import describe as D
+    return D._ollama_chat_with_retry(model=model, messages=msgs, role="describe",
+                                     options={"temperature": 0.0, "num_ctx": 16384})
+
+
+def _v2_finish(rec, parsed, sent, handles, people):
+    """Spans as code sees them: the box arm's roster boxes get their person (code maps the
+    box), then the naming rules and the template."""
+    from photosearch import grounded_describe as GD
+    rec.update(parsed)
+    if not handles:
+        for sp in rec["spans"]:
+            for b in sp["written"]:
+                if b in sent:
+                    sp["written"][b] = sent[b]["person_id"]
+            sp["check"] = GD.cross_check(sp["written"], sent)
+    GD.name_spans(rec["spans"], sent, people=people)
+    for sp in rec["spans"]:                     # json keys are strings: keep the pairs
+        sp["written"] = [[b, p] for b, p in sorted(sp["written"].items())]
+    rec["assembled"] = GD.assemble_v2(rec["description"], rec["spans"])
+
+
+def v2_prepare(con, pid, bodies_all, ev, arm):
+    """(g, roster, sent roster, prompt, image builder) or None when the arm skips the photo."""
+    from photosearch import grounded_describe as GD
+    g = g1_inputs(con, pid, bodies_all, ev)
+    if not g:
+        return None
+    opt = G1V2_VARIANTS[arm]
+    roster = v2_roster(con, pid, g, ev) if opt.get("roster", True) else {}
+    sent = v2_sent_roster(roster, opt.get("flip"))
+    if sent is None:
+        return None
+    prompt = GD.build_prompt_v2(len(g["targets"]), sent, placement=opt.get("placement", "first"),
+                                drawn=opt.get("drawn", False), handles=opt.get("handles", True))
+    return g, roster, sent, prompt
+
+
+def v2_images(pid, g, sent, drawn):
+    from photosearch import grounded_describe as GD
+    from photosearch import people_bind as PB
+    img = str(original(pid))
+    boxes = [t["bbox"] for t in g["targets"]]
+    overlay = (GD.draw_boxes_labelled(img, boxes, {b: f"P{e['person_id']}" for b, e in sent.items()})
+               if drawn and sent else PB.draw_boxes(img, boxes))
+    return [_clean_b64(img), overlay]
+
+
+def _roster_json(roster, sent):
+    return [{"box": b, "person_id": sent[b]["person_id"], "face_id": sent[b]["face_id"],
+             "body_bbox": sent[b]["body_bbox"], "label_source": sent[b]["label_source"],
+             "gender": roster[b]["gender"], "age": roster[b]["age"], "true_person_id": roster[b]["person_id"],
+             "gender_sent": sent[b]["gender_sent"], "age_sent": sent[b]["age"], "flipped": sent[b]["flipped"]}
+            for b in sorted(sent)]
+
+
+def _people(con, pid, bodies_all):
+    from photosearch import people_bind as PB
+    from photosearch import people_bind_store as store
+    inp = store.claim_input(con, pid)
+    bodies = bodies_all.get(str(pid), [])
+    return PB.people_in_photo(inp["faces"], bodies) if inp and bodies else None
+
+
+def cmd_g1v2_run(a):
+    from photosearch import describe as D
+    from photosearch import grounded_describe as GD
+    from photosearch import model_eval
+    os.environ.setdefault("PHOTOSEARCH_TEXT_LLM_URL", "http://localhost:1234/v1")
+    os.environ.setdefault("PHOTOSEARCH_LLM_REASONING_EFFORT", "none")
+    if a.variant in G1V2_DERIVED:
+        return cmd_g1v2_derived(a)
+    opt = G1V2_VARIANTS[a.variant]
+    handles = opt.get("handles", True)
+    con = ro(a.db)
+    sample = _jload(Path(a.sample) if a.sample else HERE / "sample.json", {})
+    bodies_all = _jload(HERE / "bodies.json", {})["photos"]
+    if a.sample:
+        bodies_all.update(_jload(Path(a.sample).with_name(Path(a.sample).stem + "-bodies.json"), {}).get("photos", {}))
+    ev = load_evidence()
+    spec = {"model": a.model, "variant": a.variant, "prompt_version": GD.PROMPT_VERSION,
+            "sample": Path(a.sample).name if a.sample else "sample.json"}
+    runp = G1 / "runs" / f"{a.variant}{a.suffix}.json"
+    run = _jload(runp, {"spec": spec, "preds": {}})
+    if run["spec"] != spec and not a.dry_run:
+        sys.exit(f"{runp} was made with {run['spec']}: use another --suffix")
+    pids = sorted((p for p, m in sample.items() if a.split == "all" or m["split"] == a.split), key=int)
+    if a.redo_errors:
+        for p_ in [p_ for p_, r_ in run["preds"].items() if r_.get("error")]:
+            del run["preds"][p_]
+    if a.only:
+        pids = [p for p in pids if p in set(a.only.split(","))]
+    if not a.dry_run:
+        model_eval.pin_role_model("describe", a.model)
+    t_all, n_new, fails, shown = time.time(), 0, 0, 0
+    for pid_s in pids:
+        if pid_s in run["preds"] and not a.dry_run:
+            continue
+        pid = int(pid_s)
+        prep = v2_prepare(con, pid, bodies_all, ev, a.variant)
+        if not prep:
+            continue
+        g, roster, sent, prompt = prep
+        if a.dry_run:
+            print(f"===== {pid} ({len(g['targets'])} boxes, roster {sorted(sent)}) =====\n{prompt}\n")
+            shown += 1
+            if shown >= a.dry_run:
+                return
+            continue
+        images = v2_images(pid, g, sent, opt.get("drawn", False))
+        names = [e["name"] for e in roster.values()]
+        msgs = [{"role": "user", "content": prompt, "images": images}]
+        rec = {"prompt_version": GD.PROMPT_VERSION, "model": a.model, "targets": g["targets"],
+               "roster": _roster_json(roster, sent), "people": _people(con, pid, bodies_all)}
+        t0 = time.time()
+        try:
+            raw = _v2_chat(a.model, msgs)
+            fails = 0
+        except D.TruncatedOutput as e:
+            raw, rec["error"] = None, f"truncated: {e}"[:200]
+        except Exception as e:                       # noqa: BLE001 - transport: never cached
+            fails += 1
+            print(f"  ! {pid}: {type(e).__name__}: {e}", flush=True)
+            if fails >= 5:
+                sys.exit("5 transport failures in a row: stopping")
+            continue
+        if raw is None and "error" not in rec:
+            continue
+        rec["raw"] = raw
+        n = len(g["targets"])
+        if raw is not None:
+            try:
+                _v2_finish(rec, GD.parse_v2(raw, n, sent, names), sent, handles, rec["people"])
+            except D.UnusableAnswer as e:
+                rec["error"] = str(e)[:200]
+            kind, fix = _v2_fix_for(rec.get("error", ""), handles)
+            if fix:
+                rec["rewrite"] = kind
+                try:
+                    raw2 = _v2_chat(a.model, msgs + [{"role": "assistant", "content": raw},
+                                                     {"role": "user", "content": fix}])
+                except Exception as e:               # noqa: BLE001 - keep the first error
+                    raw2 = None
+                    rec["retry_error"] = f"{type(e).__name__}: {e}"[:200]
+                if raw2:
+                    rec["raw_first"], rec["raw"] = raw, raw2
+                    try:
+                        _v2_finish(rec, GD.parse_v2(raw2, n, sent, names), sent, handles, rec["people"])
+                        rec.pop("error", None)
+                    except D.UnusableAnswer as e:
+                        rec["error"] = str(e)[:200]
+                        try:
+                            _v2_finish(rec, GD.strip_marks_v2(raw2, n, sent, names), sent, handles, rec["people"])
+                            rec["fallback"] = rec.pop("error")
+                        except D.UnusableAnswer:
+                            pass
+        rec["secs"] = round(time.time() - t0, 2)
+        run["preds"][pid_s] = rec
+        n_new += 1
+        if n_new % 10 == 0:
+            _jsave(runp, run)
+            print(f"  {n_new} new, {(time.time() - t_all) / n_new:.1f}s/photo", flush=True)
+    _jsave(runp, run)
+    print(f"g1v2-run {a.variant}: {n_new} new photos -> {runp}")
+
+
+def _spans_dict(sp):
+    return dict(sp, written={b: p for b, p in sp["written"]})
+
+
+def cmd_g1v2_derived(a):
+    """``v2-id-fixroster``: one FIX_ROSTER turn on v2-id answers with a roster conflict.
+    ``v2-id-ovl``: the overlap second call on v2-id's named spans."""
+    from photosearch import describe as D
+    from photosearch import grounded_describe as GD
+    from photosearch import model_eval
+    from photosearch import people_bind as PB
+    model_eval.pin_role_model("describe", a.model)
+    model_eval.pin_role_model("bind", a.model)
+    con = ro(a.db)
+    bodies_all = _jload(HERE / "bodies.json", {})["photos"]
+    ev = load_evidence()
+    base = _jload(G1 / "runs" / f"v2-id{a.suffix}.json", {})
+    runp = G1 / "runs" / f"{a.variant}{a.suffix}.json"
+    spec = dict(base["spec"], variant=a.variant)
+    run = _jload(runp, {"spec": spec, "preds": {}})
+    if run["spec"] != spec:
+        sys.exit(f"{runp} was made with {run['spec']}")
+    n_new = 0
+    for pid_s, r in sorted(base["preds"].items(), key=lambda kv: int(kv[0])):
+        if pid_s in run["preds"] or "description" not in r or (a.only and pid_s not in a.only.split(",")):
+            continue
+        pid = int(pid_s)
+        sent = {e["box"]: {"person_id": e["person_id"], "face_id": e["face_id"], "body_bbox": e["body_bbox"],
+                           "gender": e["gender_sent"], "age": e["age_sent"]} for e in r["roster"]}
+        rec = {"base_spans": len(r["spans"])}
+        if a.variant == "v2-id-ovl":
+            named = [sp for sp in r["spans"] if sp.get("named")]
+            if not named:
+                continue
+            img = str(original(pid))
+            out = []
+            for sp in named:
+                slot = {"faces": [{"face_id": f} for f in sp["face_ids"]],
+                        "spans": [{"text": sp["phrase"]}], "kind": "group" if len(sp["boxes"]) > 1 else "single"}
+                try:
+                    kept = PB.overlap_checked(img, r["description"], [slot], r["targets"], a.model)
+                except D.UnusableAnswer as e:
+                    kept = None
+                    rec.setdefault("errors", []).append(str(e)[:120])
+                out.append({"key": _anchor_key(pid_s, sp), "kept": None if kept is None else bool(kept),
+                            "rivals": len(PB.overlap_rivals(slot, r["targets"]))})
+            rec["ovl"] = out
+        else:
+            bad = [sp for sp in r["spans"] if not sp.get("roster_ok", True)]
+            if not bad:
+                continue
+            sp = bad[0]
+            b = next(b for b in sp["boxes"] if b in sent)
+            g, _roster, sent2, prompt = v2_prepare(con, pid, bodies_all, ev, "v2-id")
+            msgs = [{"role": "user", "content": prompt, "images": v2_images(pid, g, sent2, False)},
+                    {"role": "assistant", "content": r["raw"]},
+                    {"role": "user", "content": GD.fix_roster_prompt(b, sent[b], sp["phrase"])}]
+            rec.update(conflicts_before=len(bad), fix_box=b, fix_phrase=sp["phrase"])
+            raw2 = _v2_chat(a.model, msgs)
+            rec["raw"] = raw2
+            try:
+                p2 = GD.parse_v2(raw2, len(r["targets"]), sent, [e["name"] for e in _roster.values()])
+                rec.update(description=p2["description"], spans_after=len(p2["spans"]),
+                           conflicts_after=sum(1 for s in p2["spans"] if not s["roster_ok"]),
+                           fixed_target=not any(not s["roster_ok"] and b in s["boxes"] for s in p2["spans"]))
+            except D.UnusableAnswer as e:
+                rec["error"] = str(e)[:200]
+        run["preds"][pid_s] = rec
+        n_new += 1
+        if n_new % 10 == 0:
+            _jsave(runp, run)
+    _jsave(runp, run)
+    print(f"{a.variant}: {n_new} new photos -> {runp}")
+
+
+def _no_marks(raw):
+    from photosearch import grounded_describe as GD
+    return GD.ANCHOR_RE.sub(lambda m: m.group(1), raw or "")
+
+
+def _gender_set(text):
+    from photosearch import grounded_describe as GD
+    return ("F" if GD.FEMALE_WORDS_RE.search(text) else "") + ("M" if GD.MALE_WORDS_RE.search(text) else "")
+
+
+def _v2_view(pid_s, r, ev):
+    """(roster by box with the TRUE gender/age, spans as dicts) for a v2 record or an old
+    run (roster rebuilt from its targets: trusted, keypoint-linked)."""
+    if "roster" in r:
+        roster = {e["box"]: {"person_id": e["true_person_id"], "gender": e["gender"], "age": e["age"],
+                             "gender_sent": e["gender_sent"], "flipped": e["flipped"]} for e in r["roster"]}
+        spans = [_spans_dict(sp) for sp in r.get("spans", [])]
+    else:
+        ok = kp_ok(ev, int(pid_s))
+        roster = {t["n"]: {"person_id": t["person"], "gender": t["gender"], "age": t["age"],
+                           "gender_sent": t["gender"], "flipped": t["n"] == r.get("flip")}
+                  for t in r["targets"] if t["person"] and t["face_id"] in ok}
+        spans = r.get("spans", [])
+    return roster, spans
+
+
+def cmd_g1v2_report(a):
+    """Automatic numbers per arm (plan, "Metrics") + the owner's named-mark verdicts."""
+    from photosearch import grounded_describe as GD
+    con = ro(a.db)
+    sample = _jload(Path(a.sample) if a.sample else HERE / "sample.json", {})
+    verdicts = _jload(CONFIRM / "sheet" / "saved-labels.json", {})
+    ev = load_evidence()
+    asa = con.execute("SELECT id FROM persons WHERE name = 'Asa Goldman'").fetchone()
+    asa = asa[0] if asa else None
+    id_run = _jload(G1 / "runs" / f"v2-id{a.suffix}.json", {}).get("preds", {})
+    noctx = _jload(G1 / "runs" / "v2-noctx.json", {}).get("preds", {})
+    stored, out, lists = {}, {}, defaultdict(list)
+    med = lambda xs: sorted(xs)[len(xs) // 2] if xs else None
+    for v in a.variants.split(","):
+        preds = _jload(G1 / "runs" / f"{v}.json", {}).get("preds", {})
+        c, chk, rw = Counter(), Counter(), Counter()
+        lens, secs, rn, rd = [], [], 0, 0
+        for pid_s, r in sorted(preds.items(), key=lambda kv: int(kv[0])):
+            if pid_s not in sample or sample[pid_s]["split"] not in a.splits.split(","):
+                continue
+            c["photos"] += 1
+            if r.get("rewrite") or r.get("retried"):
+                c["rewrite"] += 1
+                rw[r.get("rewrite") or "v1"] += 1
+            first = r.get("raw_first") or r.get("raw") or ""
+            c["id_leak_first"] += bool(GD.ID_IN_PROSE_RE.search(_no_marks(first)))
+            if "description" not in r:
+                c["unusable"] += 1
+                lists[f"{v} unusable"].append(f"{pid_s}: {r.get('error', '')[:70]}")
+                continue
+            d = r["description"]
+            c["id_leak_after"] += bool(GD.ID_IN_PROSE_RE.search(d))
+            c["nospan"] += bool(r.get("fallback"))
+            c["degenerate"] += bool(r.get("degenerate"))
+            lens.append(len(d))
+            secs.append(r.get("secs") or 0)
+            if pid_s not in stored:
+                stored[pid_s] = con.execute("SELECT description FROM photos WHERE id=?", (int(pid_s),)).fetchone()[0] or ""
+            sw = _people_words(stored[pid_s])
+            rd += len(sw)
+            rn += len(sw & _people_words(d))
+            raw_all = (r.get("raw_first") or "") + " " + (r.get("raw") or "")
+            echo = bool(ECHO_RE.search(d)) or bool(re.search(r":\s*P0\b", raw_all))
+            c["example_echo"] += echo
+            if echo:
+                lists[f"{v} example echo"].append(pid_s)
+            c["yellow_jersey"] += bool(re.search(r"yellow jersey", d, re.I))
+            roster, spans = _v2_view(pid_s, r, ev)
+            c["roster_photos"] += bool(roster)
+            starts = [sp["start"] for sp in spans]
+            asa_hit = False
+            for i, sp in enumerate(spans):
+                members = [roster[b] for b in sp["boxes"] if b in roster]
+                if "check" in sp:
+                    if members or sp["check"] in ("orphan", "foreign"):
+                        chk[sp["check"]] += 1
+                if not members:
+                    continue
+                c["roster_spans"] += 1
+                trail = GD._trailing(d, sp, starts[i + 1] if i + 1 < len(starts) else None)
+                why = GD.roster_conflict(sp["phrase"], trail, members)
+                if why:
+                    c["wrong_gender_age"] += 1
+                    lists[f"{v} wrong gender/age"].append(f"{pid_s} box {sp['boxes']}: [{sp['phrase']}] {why}")
+                    if asa in [m["person_id"] for m in members]:
+                        asa_hit = True
+                if len(sp["boxes"]) == 1:
+                    m = members[0]
+                    if m["gender"] == "male" and FEMALE_RE.search(sp["phrase"]):
+                        c["girl_on_boy"] += 1
+                    if m["gender"] == "female" and GD.MALE_WORDS_RE.search(sp["phrase"]):
+                        c["boy_on_girl"] += 1
+                if sp.get("named"):
+                    c["named"] += 1
+                    vv = verdicts.get(_anchor_key(pid_s, sp), {}).get("v")
+                    if vv:
+                        c["named_right" if vv == "right" else "named_wrong"] += 1
+                        if vv != "right":
+                            lists[f"{v} named wrong"].append(f"{pid_s} [{sp['phrase']}] {sp['boxes']}: {vv}")
+                    else:
+                        c["named_unjudged"] += 1
+                elif "why_generic" in sp:
+                    c["generic:" + str(sp["why_generic"])] += 1
+            c["asa_photos"] += asa_hit
+            flipped = [b for b, e in roster.items() if e["flipped"] is True]
+            if flipped:
+                b = flipped[0]
+                want = "F" if roster[b]["gender_sent"] == "female" else "M"
+                fs = [sp for sp in spans if b in sp["boxes"] and len(sp["boxes"]) == 1]
+                c["flip_photos"] += 1
+                for sp in fs:
+                    i = spans.index(sp)
+                    gs = _gender_set(sp["phrase"] + " " + GD._trailing(d, sp, starts[i + 1] if i + 1 < len(starts) else None))
+                    c["flip_spans"] += 1
+                    c["flip_spans_gendered"] += bool(gs)
+                    c["flip_compliant"] += gs == want
+                base = id_run.get(pid_s)
+                if base and "description" in base:
+                    _, bspans = _v2_view(pid_s, base, ev)
+                    def per_box(ss):
+                        o = defaultdict(str)
+                        for s_ in ss:
+                            if len(s_["boxes"]) == 1:
+                                o[s_["boxes"][0]] += _gender_set(s_["phrase"])
+                        return {k: "".join(sorted(set(x))) for k, x in o.items()}
+                    mine, theirs = per_box(spans), per_box(bspans)
+                    if any(mine[k] != theirs[k] for k in set(mine) & set(theirs) if k != b):
+                        c["flip_spill"] += 1
+                        lists[f"{v} flip spill"].append(pid_s)
+            if v == "v2-id" and pid_s in noctx and "description" in noctx[pid_s]:
+                for sp in noctx[pid_s].get("spans", []):
+                    if len(sp["boxes"]) == 1 and sp["boxes"][0] in roster and \
+                            roster[sp["boxes"][0]]["gender"] == "male" and FEMALE_RE.search(sp["phrase"]):
+                        lists["risk: no-context 'girl' where the roster says boy"].append(f"{pid_s} box {sp['boxes'][0]}")
+        n_ok = c["photos"] - c["unusable"]
+        res = dict(c, rewrite_reasons=dict(rw), checks=dict(chk), len_median=med(lens), s_per_photo=med(secs),
+                   people_word_recall=round(rn / rd, 3) if rd else None,
+                   nospan_pct=round(100 * c["nospan"] / n_ok, 1) if n_ok else None,
+                   rewrite_pct=round(100 * c["rewrite"] / c["photos"], 1) if c["photos"] else None)
+        roster_marks = sum(v_ for k, v_ in chk.items() if k != "none")
+        if roster_marks:
+            res["disagree_orphan_pct"] = round(100 * (chk["disagree"] + chk["orphan"]) / roster_marks, 1)
+        if c["named_right"] + c["named_wrong"]:
+            res["named_precision"] = round(100 * c["named_right"] / (c["named_right"] + c["named_wrong"]), 1)
+        if c["flip_spans_gendered"]:
+            res["flip_compliance_pct"] = round(100 * c["flip_compliant"] / c["flip_spans_gendered"], 1)
+        out[v] = res
+        print(f"== {v} ({a.splits}): " + json.dumps(res, sort_keys=True))
+    for k, xs in lists.items():
+        print(f"-- {k} ({len(xs)}): " + "; ".join(xs[:40]))
+    _jsave(G1 / f"report-v2-{a.splits.replace(',', '+')}{a.suffix}.json", {"arms": out, "lists": lists})
+
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1321,8 +1801,24 @@ def main():
     gp.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"), required=not os.environ.get("PHOTOSEARCH_DB"))
     gp.add_argument("--variant", required=True)
     gp.add_argument("--n", type=int, default=40)
+    v2 = sub.add_parser("g1v2-run")
+    v2.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"), required=not os.environ.get("PHOTOSEARCH_DB"))
+    v2.add_argument("--variant", required=True, choices=sorted(G1V2_VARIANTS) + list(G1V2_DERIVED))
+    v2.add_argument("--model", default="qwen/qwen3.5-9b")
+    v2.add_argument("--split", default="dev", choices=["dev", "holdout", "all"])
+    v2.add_argument("--sample", default="", help="sample file (default people-bind/sample.json)")
+    v2.add_argument("--suffix", default="", help="run file suffix (a new prompt version needs a new file)")
+    v2.add_argument("--only", default="")
+    v2.add_argument("--redo-errors", action="store_true")
+    v2.add_argument("--dry-run", type=int, default=0, help="print N prompts, no model call")
+    vr = sub.add_parser("g1v2-report")
+    vr.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"), required=not os.environ.get("PHOTOSEARCH_DB"))
+    vr.add_argument("--variants", required=True)
+    vr.add_argument("--splits", default="dev")
+    vr.add_argument("--sample", default="")
+    vr.add_argument("--suffix", default="", help="suffix of the v2-id run that flip spill compares against")
     a = ap.parse_args()
-    {"g1-run": cmd_g1_run, "g1-pair-sheet": cmd_g1_pair_sheet, "g1-sheet": cmd_g1_sheet, "g1-report": cmd_g1_report, "who-sheet": cmd_who_sheet, "evidence": cmd_evidence, "attrs": cmd_attrs, "g0": cmd_g0}[a.cmd](a)
+    {"g1v2-run": cmd_g1v2_run, "g1v2-report": cmd_g1v2_report, "g1-run": cmd_g1_run, "g1-pair-sheet": cmd_g1_pair_sheet, "g1-sheet": cmd_g1_sheet, "g1-report": cmd_g1_report, "who-sheet": cmd_who_sheet, "evidence": cmd_evidence, "attrs": cmd_attrs, "g0": cmd_g0}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -279,7 +279,7 @@ def parse(raw: str, n_boxes: int, names: Optional[list[str]] = None,
 
 V2_HEAD = TWO_IMAGE_HEAD
 V2_DRAWN_LINE = ("A known person's box also shows their P-number next to the box number, "
-                 "like 4·P39.\n\n")
+                 "like 4·P0.\n\n")
 
 KNOWN_INTRO = (
     "KNOWN PEOPLE. These people have been identified by the family. Their gender and age below\n"
@@ -305,12 +305,12 @@ _V2_MARK_OPEN = (
     "the box number(s) in round brackets right after. ")
 _V2_MARK_ID = (
     "For a known person, write the box number,\n"
-    "a colon and their P-number: [a boy in a red cap](2:P39). For a group, list each box, with\n"
-    "the P-number for any known member: [two men](1,3:P8). ")
+    "a colon and their P-number: [a boy in a red cap](2:P0). For a group, list each box, with\n"
+    "the P-number for any known member: [two men](1,3:P0). ")
 _V2_EXAMPLE_ID = (
     "Example (a different photo):\n"
     "[a woman in a grey coat](2:P0) hands an umbrella to [two men](1,3), who stand at a bus stop.\n"
-    "That sentence only shows the form; P0 is not a real person, and your people, scene and\n"
+    "That sentence only shows the form; P0 is never a real person, and your people, scene and\n"
     "P-numbers come from the photos and the list above. ")
 _V2_RULES_ID = (
     "Inside the square brackets write only\n"
@@ -338,11 +338,11 @@ REMINDER_BOX = "Reminder: {items}. Known people keep their listed gender and age
 FIX_MARKUP_V2 = (
     "Rewrite the same description with every mark in this form: describing words in square "
     "brackets, then box number(s) in round brackets, with a colon and P-number for a known "
-    "person, like [a boy in a blue jersey](4:P39). No number or P-number in square brackets. "
+    "person, like [a boy in a blue jersey](4:P0). No number or P-number in square brackets. "
     "Keep every person mark. Answer with the description only.")
 FIX_IDS = (
     "Rewrite the same description so that P-numbers appear only inside the round brackets "
-    "after marked words, like [a boy in a blue jersey](4:P39). In the sentences, describe each "
+    "after marked words, like [a boy in a blue jersey](4:P0). In the sentences, describe each "
     "person by what they look like and do. Keep every person mark. Answer with the "
     "description only.")
 FIX_LEAK_V2 = FIX_LEAK + " Keep every person mark and P-number."

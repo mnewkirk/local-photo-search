@@ -142,3 +142,7 @@ evals/people-bind/originals/
 # people-context evals (G0/G1): cached previews, evidence, model runs, generated pages
 evals/people-bind/g0/
 evals/people-bind/g1/runs/
+evals/people-bind/g0
+evals/people-bind/g1confirm/
+evals/people-bind/g1pair/
+evals/people-bind/g1/report-*.json

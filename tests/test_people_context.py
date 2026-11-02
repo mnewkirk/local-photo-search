@@ -394,3 +394,34 @@ def test_v2_draw_boxes_labelled(tmp_path):
     b64 = GD.draw_boxes_labelled(str(p), [[50, 150, 250, 40], [60, 350, 280, 220]], {2: "P39"})
     im = Image.open(io.BytesIO(base64.b64decode(b64)))
     assert im.size == (400, 300)
+
+
+# --- the v2 eval harness: flip / swap rosters --------------------------------
+
+def _harness():
+    import importlib.util
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "evals", "people_context_eval.py")
+    spec = importlib.util.spec_from_file_location("people_context_eval_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_v2_sent_roster_flip_and_swap():
+    E = _harness()
+    roster = {1: {"person_id": 39, "face_id": 1, "body_bbox": [0, 100, 400, 0], "label_source": "manual",
+                  "gender": "male", "age": 10},
+              3: {"person_id": 12, "face_id": 2, "body_bbox": [0, 300, 200, 200], "label_source": "strict",
+                  "gender": "female", "age": 9}}
+    same = E.v2_sent_roster(roster, None)
+    assert same[1]["gender"] == "male" and not same[1]["flipped"]
+    f = E.v2_sent_roster(roster, "gender")
+    assert f[1]["gender"] == "female" and f[1]["flipped"] is True and f[3]["gender"] == "female"
+    assert roster[1]["gender"] == "male"                     # the true roster is untouched
+    s = E.v2_sent_roster(roster, "swap")
+    assert s[1]["person_id"] == 12 and s[3]["person_id"] == 39
+    assert s[1]["body_bbox"] == roster[1]["body_bbox"]       # boxes stay; people move
+    assert E.v2_sent_roster({1: roster[1]}, "swap") is None
+    assert E.v2_sent_roster({1: dict(roster[1], gender=None)}, "gender") is None

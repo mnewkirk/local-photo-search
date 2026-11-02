@@ -1,8 +1,9 @@
 # People context in describe, v2: known people by person-id handle
 
 **Status: 📐 planned 2026-11-01 by plan-debate (two planners, two critique rounds). Evals before any wiring;
-owner decided the two open gates 2026-11-01 (flip gate 60%, two-turn ablation paused). Step 1 done 2026-11-01
-(`photosearch/grounded_describe.py` v2 section, `PROMPT_VERSION` b477120346ff); Step 2 next. Status lives in `README.md`.**
+owner decided the two open gates 2026-11-01 (flip gate 60%, two-turn ablation paused). Steps 1-2 done 2026-11-01
+(`grounded_describe.py` v2 section; `g1v2-run` / `g1v2-report` in `evals/people_context_eval.py`;
+`PROMPT_VERSION` 78c6d7e177c3); Step 3 (fresh set) next. Status lives in `README.md`.**
 
 Amends docs/plans/people-context-describe.md (its Decisions table and "G0 / G1 results" stay binding; its
 "What describe knows" row is superseded by this plan: no names are sent). Measurements that led here:
