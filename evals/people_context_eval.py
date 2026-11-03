@@ -1529,6 +1529,8 @@ def cmd_g1v2_run(a):
         if n_new % 10 == 0:
             _jsave(runp, run)
             print(f"  {n_new} new, {(time.time() - t_all) / n_new:.1f}s/photo", flush=True)
+    if a.dry_run:
+        return
     _jsave(runp, run)
     print(f"g1v2-run {a.variant}: {n_new} new photos -> {runp}")
 

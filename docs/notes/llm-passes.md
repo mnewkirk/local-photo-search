@@ -1357,3 +1357,21 @@ Dev 125, qwen3.5-9b, ~2.8 s/photo, 105 photos with a roster. Runs `evals/people-
 - **Owner blind pairwise, round 4 vs stored (40 dev photos): new 14, stored 16, same 10** (G-E bar: new >=
   stored - 3; passes). G1's v1 text: 18 / 17 / 5. The median length miss (323 < 330) did not show as a
   quality loss.
+
+### people context v2: Step 6, the fresh runs (2026-11-02)
+
+Frozen: prompt `e79e164548fc`, guards `grounded_describe.py` at `97f639c`, harness `0bf0a1d`.
+
+- **Fresh set 1 (seed 20261101) burned**: every automatic gate passed but unusable, 2 of 75: a 14-box crowd
+  mark "[boys](2,...,16)" (longer than `ANCHOR_RE`'s 24 characters) and "inside box 4"; the corrective
+  turn repeated both. The strip fallback now keeps a long crowd mark as words and drops any
+  "in/at/inside/within/behind/near/by box N" aside (guards re-frozen at `117264c`). The set is kept as
+  `sample-fresh-burned-20261101.json` and excluded from redraws.
+- **Old holdout, regression only** (75 photos, round-4 prompt): unusable 0, wrong gender/age 0 (no-context
+  v1 prompt: 5, Asa 2), median length 326 (372), recall 0.655 (0.655), 63 named.
+- **Fresh set 2 (seed 20261102)**: unusable 0, nospan 2.7%, corrective turns 4.0% (+2 FIX_ROSTER), degenerate
+  5, length 332, echo / age copy / id leak 0, wrong gender/age 0, Asa 0, 75 named on 75 roster photos;
+  **recall 0.566 (bar 0.60)**. Lost: "teen" 0/9 and "girl" 0/1 (the roster rules both out for listed
+  10-year-old boys), "child" 5/26, "people" 1/9, "adult" 10/21; without the two ruled-out classes 82/135
+  = 0.607. Dev shows the same pattern (no-context v1 keeps "child" 11/48 too).
+- Overlap second call on fresh set 2's 75 named spans: 19 have a rival; 11 dropped (unjudged).
