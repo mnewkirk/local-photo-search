@@ -5,7 +5,7 @@ owner decided the two open gates 2026-11-01 (flip gate 60%, two-turn ablation pa
 (round 2 `PROMPT_VERSION` 969a5f3b3cc7; fresh set `sample-fresh.json`, seed 20261101). Dev candidate: **`v2-box` +
 FIX_ROSTER** (passes G-A, G-B, G-C on dev; `v2-id` fails G-C at 28.6%); automatic G-F 52.7% < 60%;
 owner accepted the candidate 2026-11-02. Dev round 4 (`PROMPT_VERSION` e79e164548fc: no-copy line,
-whole phrase in brackets, age-copy guard) passes G-A except median length 323 < 330; Step 5 labels in progress. Status lives in `README.md`.**
+whole phrase in brackets, age-copy guard) passes G-A except median length 323 < 330; G-E pairwise 14 / 16 / 10 passes; Step 5 named marks in progress. Status lives in `README.md`.**
 
 Amends docs/plans/people-context-describe.md (its Decisions table and "G0 / G1 results" stay binding; its
 "What describe knows" row is superseded by this plan: no names are sent). Measurements that led here:

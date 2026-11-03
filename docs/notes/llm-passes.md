@@ -1354,3 +1354,6 @@ Dev 125, qwen3.5-9b, ~2.8 s/photo, 105 photos with a roster. Runs `evals/people-
 - **The flip arm pastes the list when it contradicts the eyes**: round 3 "a girl, 10" in 28 photos, on the
   flipped kid; round 4 the age guard turns that into 17 FIX_AGES turns and 7 unusable. Compliance 43.8%,
   spill 4 (G-F, accepted by the owner at 52.7% in round 2).
+- **Owner blind pairwise, round 4 vs stored (40 dev photos): new 14, stored 16, same 10** (G-E bar: new >=
+  stored - 3; passes). G1's v1 text: 18 / 17 / 5. The median length miss (323 < 330) did not show as a
+  quality loss.
