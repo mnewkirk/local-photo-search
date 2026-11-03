@@ -1298,6 +1298,7 @@ G1V2_VARIANTS = {
     "v2-box-flip": dict(handles=False, flip="gender"),   # G-F on the box arm (dev tuning, 2026-11-01)
 }
 G1V2_DERIVED = ("v2-id-fixroster", "v2-id-ovl")      # extra calls on v2-id answers, no new describe
+from photosearch.grounded_describe import AGE_COPY_RE                # noqa: E402
 ECHO_RE = re.compile(r"\b(gr[ea]y coat|umbrella|bus stop)\b", re.I)
 _LIVE_SQL = ("SELECT person_id FROM faces WHERE photo_id=? AND person_id IS NOT NULL "
              "AND COALESCE(match_source, '') NOT IN ('rejected', 'dedupe_unmatched')")
@@ -1360,6 +1361,8 @@ def _v2_fix_for(err, handles):
         return "leak", GD.FIX_LEAK_V2 if handles else GD.FIX_LEAK
     if "name in text" in err:
         return "names", GD.FIX_NAMES_V2 if handles else GD.FIX_NAMES
+    if "age copy" in err:
+        return "ages", GD.FIX_AGES
     return None, None
 
 
@@ -1590,7 +1593,7 @@ def cmd_g1v2_derived(a):
             msgs = [{"role": "user", "content": prompt,
                      "images": v2_images(pid, g, sent2, G1V2_VARIANTS[arm].get("drawn", False))},
                     {"role": "assistant", "content": r["raw"]},
-                    {"role": "user", "content": GD.fix_roster_prompt(b, sent[b], sp["phrase"], handles)}]
+                    {"role": "user", "content": GD.fix_roster_prompt(b, sent[b], sp["phrase"], handles, sp.get("roster_conflict"))}]
             rec.update(conflicts_before=len(bad), fix_box=b, fix_phrase=sp["phrase"])
             raw2 = _v2_chat(a.model, msgs)
             rec["raw"] = raw2
@@ -1728,6 +1731,9 @@ def cmd_g1v2_report(a):
             if echo:
                 lists[f"{v} example echo"].append(pid_s)
             c["yellow_jersey"] += bool(re.search(r"yellow jersey", d, re.I))
+            if AGE_COPY_RE.search(d):                 # the roster's "boy, 10" pasted into the text
+                c["age_copy"] += 1
+                lists[f"{v} age copy"].append(pid_s)
             roster, spans = _v2_view(pid_s, r, ev)
             c["roster_photos"] += bool(roster)
             starts = [sp["start"] for sp in spans]

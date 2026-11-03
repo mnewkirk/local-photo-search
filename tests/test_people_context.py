@@ -289,6 +289,8 @@ def test_v2_strip_fallback_drops_stray_marks():
     assert r["description"] == "A boy passes to a teammate and two others." and r["spans"] == []
     r = GD.strip_marks_v2("One boy (box 2) waves, and a girl stands in box (5), smiling.", 5, R2)
     assert r["description"] == "One boy waves, and a girl stands, smiling."
+    r = GD.strip_marks_v2("Two people sit at boxes (4) and (5).", 5, R2)
+    assert r["description"] == "Two people sit."
     with pytest.raises(UnusableAnswer):                     # the id is never stripped silently
         GD.strip_marks_v2("A referee (1:P39) watches.", 5, R2)
 
@@ -391,6 +393,8 @@ def test_v2_prompt_version_is_stable_sha():
 def test_v2_fix_roster_prompt():
     s = GD.fix_roster_prompt(4, R2[4], "a girl in green")
     assert s.startswith("P39 (box 4) is a boy, 10. You wrote 'a girl in green'")
+    s = GD.fix_roster_prompt(4, R2[4], "a girl", handles=False, why="female word 'girl' on a male")
+    assert s.startswith("The person (box 4) is a boy. You wrote 'a girl'")
 
 
 def test_v2_draw_boxes_labelled(tmp_path):
@@ -433,3 +437,16 @@ def test_v2_sent_roster_flip_and_swap():
     assert s[1]["body_bbox"] == roster[1]["body_bbox"]       # boxes stay; people move
     assert E.v2_sent_roster({1: roster[1]}, "swap") is None
     assert E.v2_sent_roster({1: dict(roster[1], gender=None)}, "gender") is None
+
+
+def test_v2_age_copy_raises_only_with_a_roster():
+    with pytest.raises(UnusableAnswer, match="age copy"):
+        GD.parse_v2("[A boy, 10](4) runs on the grass.", 5, R2)
+    with pytest.raises(UnusableAnswer, match="age copy"):
+        GD.parse_v2("[a boy in green](4) passes to a boy aged 10.", 5, R2)
+    assert GD.parse_v2("[A boy, 10](4) runs.", 5, None)["description"] == "A boy, 10 runs."
+
+
+def test_v2_mark_rules_ask_for_the_whole_phrase():
+    for handles in (True, False):
+        assert "never [a man](4) in a red cap" in GD.build_prompt_v2(5, R2, handles=handles)

@@ -1333,3 +1333,24 @@ Dev 125, qwen3.5-9b, ~2.8 s/photo, 105 photos with a roster. Runs `evals/people-
 - **Owner, 2026-11-02: candidate accepted** with G-F at 52.7%: the listed gender overrides appearance in
   about half the spans by instruction alone; FIX_ROSTER enforces the rest. G-D and G-E (owner labels) and
   the fresh-set run still decide.
+
+### people context v2: dev rounds 3-4 after the first owner verdicts (2026-11-02)
+
+- **Owner verdicts on round 2 (`v2-box` + FIX_ROSTER): 86 right, 8 wrong named (91.5%)**, below 97%. Five
+  wrong marks are the roster pasted as the phrase ("boy aged 10", "A boy, 10"): **38 of 125 round-2
+  descriptions copy the list into the raw text** (no other arm does). Three are the G1 pick between two
+  similar players (246056, 246455, 246460). Treating "boy, 10" as a bare phrase drops 5 wrong and 31 right
+  (94.8%, 58 named): not a fix. The pairwise page was taken down after 1 vote (kept in
+  `g1pair-v2/r2-votes.json`).
+- **Round 3** (KNOWN block: "Do not copy this list into the description: never write an age as a number"):
+  copies 38 -> 2, but named 94 -> 65 and degenerate 16: the copied age had hidden bare marks; the model now
+  writes "[a boy](4) in a green jersey" (37 of 58 bare/degenerate spans have the clothing right after).
+- **Round 4** (mark rule: "Put the whole phrase, clothing included, inside the square brackets: [a man in a
+  red cap](4), never [a man](4) in a red cap"; `AGE_COPY_RE` guard on roster photos with a FIX_AGES turn; a
+  gender-conflict FIX_ROSTER states the gender only, since "is a boy, 10" came back as "a boy aged 10"):
+  unusable 0, nospan 4.8%, corrective turns 5.6% (15.2% with FIX_ROSTER), degenerate 11, **length 323
+  (bar 330)**, recall 0.606, echo / age copy 0, wrong gender/age 0, Asa 0, named 101; FIX_ROSTER 12/12
+  targets, 38/38 marks.
+- **The flip arm pastes the list when it contradicts the eyes**: round 3 "a girl, 10" in 28 photos, on the
+  flipped kid; round 4 the age guard turns that into 17 FIX_AGES turns and 7 unusable. Compliance 43.8%,
+  spill 4 (G-F, accepted by the owner at 52.7% in round 2).

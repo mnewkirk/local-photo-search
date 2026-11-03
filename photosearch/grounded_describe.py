@@ -286,7 +286,9 @@ KNOWN_INTRO = (
     "are facts, not guesses: use them even when the person looks different (long hair, clothing\n"
     "colour, build or pose can mislead). A person listed as a boy is \"a boy\", never \"a girl\",\n"
     "\"she\" or \"her\"; a person listed as a girl is \"a girl\", never \"a boy\", \"he\" or \"him\"; a\n"
-    "person listed as aged 10 is a child, never \"a man\", \"a woman\" or \"a teenager\".\n")
+    "person listed as aged 10 is a child, never \"a man\", \"a woman\" or \"a teenager\". Do not\n"
+    "copy this list into the description: never write an age as a number. Describe a known person\n"
+    "like anyone else, by what they wear and do.\n")
 KNOWN_TAIL = ("Every other box is a person nobody has identified: describe them only from what "
               "you see.\n\n")
 
@@ -313,6 +315,8 @@ _V2_EXAMPLE_ID = (
     "That sentence only shows the form; P0 is never a real person, and your people, scene and\n"
     "P-numbers come from the photos and the list above. ")
 _V2_RULES_ID = (
+    "Put the whole phrase, clothing included, inside the square brackets: [a man in a red\n"
+    "cap](4), never [a man](4) in a red cap. "
     "Inside the square brackets write only\n"
     "ordinary describing words (age, gender, clothing, role); a bare P-number in brackets is\n"
     "wrong, and a P-number appears ONLY after a colon inside the round brackets, never in the\n"
@@ -325,6 +329,8 @@ _V2_EXAMPLE_BOX = (
     "[a woman in a grey coat](2) hands an umbrella to [two men](1,3), who stand at a bus stop.\n"
     "That sentence only shows the form; your people and scene come from the photos. ")
 _V2_RULES_BOX = (
+    "Put the whole phrase, clothing included, inside the square brackets: [a man in a red\n"
+    "cap](4), never [a man](4) in a red cap. "
     "Inside the square brackets write only\n"
     "ordinary describing words (age, gender, clothing, role); never write a number in square\n"
     "brackets. Mark only people, never objects.\n"
@@ -346,6 +352,8 @@ FIX_IDS = (
     "person by what they look like and do. Keep every person mark. Answer with the "
     "description only.")
 FIX_LEAK_V2 = FIX_LEAK + " Keep every person mark and P-number."
+FIX_AGES = ("Rewrite the same description without writing anyone's age as a number: describe each "
+            "person by what they wear and do. Keep every person mark. Answer with the description only.")
 FIX_NAMES_V2 = FIX_NAMES + " Keep every person mark and P-number."
 FIX_ROSTER = (
     "{handle} (box {box}) is {noun}. You wrote '{phrase}' for them. Rewrite the same "
@@ -357,7 +365,7 @@ def _frozen_text() -> str:
     return "\x1e".join([V2_HEAD, V2_DRAWN_LINE, KNOWN_INTRO, KNOWN_TAIL, V2_PHOTO_RULES,
                         _V2_MARK_OPEN, _V2_MARK_ID, _V2_EXAMPLE_ID, _V2_RULES_ID,
                         _V2_EXAMPLE_BOX, _V2_RULES_BOX, REMINDER, REMINDER_BOX,
-                        FIX_MARKUP_V2, FIX_IDS, FIX_LEAK_V2, FIX_NAMES_V2, FIX_ROSTER])
+                        FIX_MARKUP_V2, FIX_IDS, FIX_LEAK_V2, FIX_NAMES_V2, FIX_ROSTER, FIX_AGES])
 
 
 def _prompt_version() -> str:
@@ -423,9 +431,13 @@ def build_prompt_v2(n_boxes: int, roster: Optional[dict] = None, placement: str 
     return p
 
 
-def fix_roster_prompt(box: int, e: dict, phrase: str, handles: bool = True) -> str:
-    """The FIX_ROSTER turn; without handles (the box arm) it says "The person (box 4)"."""
+def fix_roster_prompt(box: int, e: dict, phrase: str, handles: bool = True,
+                      why: Optional[str] = None) -> str:
+    """The FIX_ROSTER turn; without handles (the box arm) it says "The person (box 4)". A
+    gender conflict states the gender only: "is a boy, 10" came back as "a boy aged 10"."""
     facts = _roster_facts(e)
+    if why and "word" in why and facts and facts[0] in ("boy", "girl", "man", "woman"):
+        facts = facts[:1]
     noun = ("a " + ", ".join(facts)) if facts and facts[0] in ("boy", "girl", "man", "woman") \
         else (", ".join(facts) or "listed")
     return FIX_ROSTER.format(handle=f"P{e['person_id']}" if handles else "The person", box=box,
@@ -442,7 +454,8 @@ _STRAY_PAREN_NUM_RE = re.compile(r"(?<!\])\s*\(\s*\d{1,2}(?:\s*,\s*\d{1,2})*\s*\
 _EMPTY_PAREN_RE = re.compile(r"\s*\(\s*(?:and|,)?\s*\)")
 # A box reference the model wrote as an aside: "(box 2)", "in box (5)", "(boxes 3 and 4)".
 _BOX_ASIDE_RE = re.compile(r"\s*\(\s*box(?:es)?\s+\d{1,2}(?:\s*(?:,|and)\s*\d{1,2})*\s*\)"
-                           r"|\s+in\s+box(?:es)?\s*\(?\s*\d{1,2}\s*\)?(?=[\s,.;])", re.I)
+                           r"|\s+(?:in|at)\s+box(?:es)?\s*\(?\s*\d{1,2}\s*\)?"
+                           r"(?:\s*(?:,|and)\s*\(?\s*\d{1,2}\s*\)?)*(?=[\s,.;])", re.I)
 _STRAY_V2_RE = re.compile(r"\s*\[\s*\d{1,2}(?:\s*:\s*P\d{1,6})?(?:\s*[,-]\s*\d{1,2}(?:\s*:\s*P\d{1,6})?)*\s*\]")
 
 FEMALE_WORDS_RE = re.compile(r"\b(girls?|wom[ae]n|she|her|hers|herself|female|lady|ladies|"
@@ -455,6 +468,8 @@ _CHILD_WORDS_RE = re.compile(r"\b(boys?|girls?|child|children|kids?|toddlers?|ba
 _PLURAL_FEMALE_RE = re.compile(r"\b(girls|women|ladies)\b", re.I)
 _PLURAL_MALE_RE = re.compile(r"\b(boys|men|gentlemen)\b", re.I)
 ROSTER_WINDOW = 40
+# The roster's facts pasted into the text ("A boy, 10 walks", "a boy aged 10"): dev r2, 38 of 125.
+AGE_COPY_RE = re.compile(r"\b(?:boy|girl|man|woman)s?,\s*\d{1,2}\b|\baged\s+\d{1,2}\b|\b\d{1,2}-year-old\b", re.I)
 
 
 def _trailing(desc: str, sp: dict, nxt: Optional[int]) -> str:
@@ -583,6 +598,9 @@ def parse_v2(raw: str, n_boxes: int, roster: Optional[dict] = None,
     hit = name_in_text(desc, names or [])
     if hit:
         raise UnusableAnswer(f"grounded describe: name in text: {hit!r}")
+    hit = AGE_COPY_RE.search(desc) if roster else None
+    if hit:
+        raise UnusableAnswer(f"grounded describe: age copy: {hit.group(0)!r}")
     deg = _degenerate_spans(desc, spans)
     starts = [sp["start"] for sp in spans]
     for i, sp in enumerate(spans):
