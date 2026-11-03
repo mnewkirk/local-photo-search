@@ -1375,3 +1375,5 @@ Frozen: prompt `e79e164548fc`, guards `grounded_describe.py` at `97f639c`, harne
   10-year-old boys), "child" 5/26, "people" 1/9, "adult" 10/21; without the two ruled-out classes 82/135
   = 0.607. Dev shows the same pattern (no-context v1 keeps "child" 11/48 too).
 - Overlap second call on fresh set 2's 75 named spans: 19 have a rival; 11 dropped (unjudged).
+- **Owner, 2026-11-02: recall on fresh set 2 counts as a pass** (0.607 without the "teen" / "girl" words the
+  roster rules out). Next: the owner's verdicts on its 75 named marks (G-D, overlap decision).
