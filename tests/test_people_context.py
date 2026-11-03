@@ -291,6 +291,8 @@ def test_v2_strip_fallback_drops_stray_marks():
     assert r["description"] == "One boy waves, and a girl stands, smiling."
     r = GD.strip_marks_v2("Two people sit at boxes (4) and (5).", 5, R2)
     assert r["description"] == "Two people sit."
+    r = GD.strip_marks_v2("A boy waves to [boys](2,3,4,5,7,8,9,10,11,12) near a player inside box 4.", 12, R2)
+    assert r["description"] == "A boy waves to boys near a player." and r["spans"] == []
     with pytest.raises(UnusableAnswer):                     # the id is never stripped silently
         GD.strip_marks_v2("A referee (1:P39) watches.", 5, R2)
 

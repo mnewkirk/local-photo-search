@@ -454,8 +454,11 @@ _STRAY_PAREN_NUM_RE = re.compile(r"(?<!\])\s*\(\s*\d{1,2}(?:\s*,\s*\d{1,2})*\s*\
 _EMPTY_PAREN_RE = re.compile(r"\s*\(\s*(?:and|,)?\s*\)")
 # A box reference the model wrote as an aside: "(box 2)", "in box (5)", "(boxes 3 and 4)".
 _BOX_ASIDE_RE = re.compile(r"\s*\(\s*box(?:es)?\s+\d{1,2}(?:\s*(?:,|and)\s*\d{1,2})*\s*\)"
-                           r"|\s+(?:in|at)\s+box(?:es)?\s*\(?\s*\d{1,2}\s*\)?"
+                           r"|\s+(?:in|at|inside|within|behind|near|by)\s+box(?:es)?\s*\(?\s*\d{1,2}\s*\)?"
                            r"(?:\s*(?:,|and)\s*\(?\s*\d{1,2}\s*\)?)*(?=[\s,.;])", re.I)
+# A mark naming more boxes than ANCHOR_RE's 24 characters ("[boys](2,3,4,...,16)"): a crowd, kept as
+# words without a span.
+_LONG_MARK_RE = re.compile(r"\[([^\[\]\n]{1,160})\]\(\s*\d{1,2}(?:\s*:\s*P\d{1,6})?(?:\s*,\s*\d{1,2}(?:\s*:\s*P\d{1,6})?){6,}\s*\)")
 _STRAY_V2_RE = re.compile(r"\s*\[\s*\d{1,2}(?:\s*:\s*P\d{1,6})?(?:\s*[,-]\s*\d{1,2}(?:\s*:\s*P\d{1,6})?)*\s*\]")
 
 FEMALE_WORDS_RE = re.compile(r"\b(girls?|wom[ae]n|she|her|hers|herself|female|lady|ladies|"
@@ -624,7 +627,7 @@ def strip_marks_v2(raw: str, n_boxes: int, roster: Optional[dict] = None,
     handle-free ``(n)`` groups left in the prose
     go too; a group with a P-number stays and fails the photo (never strip an id silently).
     Still raises on everything else."""
-    text = _BOX_ASIDE_RE.sub("", raw or "")
+    text = _BOX_ASIDE_RE.sub("", _LONG_MARK_RE.sub(lambda m: m.group(1), raw or ""))
     text = _EMPTY_PAREN_RE.sub("", _STRAY_PAREN_NUM_RE.sub("", _STRAY_V2_RE.sub("", text)))
     return dict(parse_v2(text, n_boxes, roster, names),
                 spans=[], unanchored=True)

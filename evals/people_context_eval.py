@@ -1875,12 +1875,21 @@ def cmd_g1_fresh_sample(a):
     con = ro(a.db)
     ev = load_evidence()
     out = HERE / "sample-fresh.json"
-    if out.exists() and not a.force:
-        sys.exit(f"{out} exists: a new draw replaces a burned set only with --force and a new --seed")
+    if out.exists():
+        if not a.burn:
+            sys.exit(f"{out} exists: a failed gate burns it; redraw with --burn and a new --seed")
+        old = _jload(out, {})
+        seed0 = next(iter(old.values()))["seed"] if old else "x"
+        if seed0 == a.seed:
+            sys.exit("a redraw needs a new --seed")
+        out.rename(HERE / f"sample-fresh-burned-{seed0}.json")
+        (HERE / "sample-fresh-bodies.json").rename(HERE / f"sample-fresh-burned-{seed0}-bodies.json")
     excluded = set(_jload(HERE / "sample.json", {}))
     for d in ("review", "review2"):
         excluded |= set(_jload(HERE / d / "sample.json", {}))
     excluded |= {p for p, _b, _ph in who_targets()}
+    for burned in sorted(p for p in HERE.glob("sample-fresh-burned-*.json") if not p.stem.endswith("-bodies")):
+        excluded |= set(_jload(burned, {}))
     excluded = {int(p) for p in excluded}
     when = {}
     for pid, d in con.execute("SELECT id, date_taken FROM photos WHERE id IN (%s)" % ",".join(map(str, excluded))):
@@ -1989,7 +1998,7 @@ def main():
     fs.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"), required=not os.environ.get("PHOTOSEARCH_DB"))
     fs.add_argument("--seed", type=int, default=FRESH_SEED)
     fs.add_argument("--n", type=int, default=FRESH_N)
-    fs.add_argument("--force", action="store_true")
+    fs.add_argument("--burn", action="store_true", help="the current set failed a gate: keep it as burned, draw anew")
     a = ap.parse_args()
     {"g1v2-rescore": cmd_g1v2_rescore, "g1-fresh-sample": cmd_g1_fresh_sample, "g1v2-run": cmd_g1v2_run, "g1v2-report": cmd_g1v2_report, "g1-run": cmd_g1_run, "g1-pair-sheet": cmd_g1_pair_sheet, "g1-sheet": cmd_g1_sheet, "g1-report": cmd_g1_report, "who-sheet": cmd_who_sheet, "evidence": cmd_evidence, "attrs": cmd_attrs, "g0": cmd_g0}[a.cmd](a)
 
