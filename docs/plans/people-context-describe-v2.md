@@ -3,8 +3,8 @@
 **Status: 📐 planned 2026-11-01 by plan-debate (two planners, two critique rounds). Evals before any wiring;
 owner decided the two open gates 2026-11-01 (flip gate 60%, two-turn ablation paused). Steps 1-4 done 2026-11-01
 (`PROMPT_VERSION` 969a5f3b3cc7; fresh set `sample-fresh.json`, seed 20261101). Dev candidate: **`v2-box` +
-FIX_ROSTER** (passes G-A, G-B, G-C on dev; `v2-id` fails G-C at 28.6%); automatic G-F 52.7% < 60%.
-Step 5 (owner dev labels: named marks, pairwise, G-F) in progress. Status lives in `README.md`.**
+FIX_ROSTER** (passes G-A, G-B, G-C on dev; `v2-id` fails G-C at 28.6%); automatic G-F 52.7% < 60%;
+owner accepted the candidate 2026-11-02. Step 5 (owner dev labels: named marks, pairwise) in progress. Status lives in `README.md`.**
 
 Amends docs/plans/people-context-describe.md (its Decisions table and "G0 / G1 results" stay binding; its
 "What describe knows" row is superseded by this plan: no names are sent). Measurements that led here:
@@ -302,6 +302,7 @@ Resolved by both planners (round 2); the last two rows were the owner's (2026-11
 | Example | off-domain adults, impossible `P0`, echo gated | same | **agreed** | 2026-11-01 |
 | Flip-compliance gate (G-F) | >= 80% | >= 60% gate, 80% reported target | **B** (owner: 60% to start) | 2026-11-01 |
 | 40-photo two-turn ablation | run it on dev (never a candidate) | drop it | **paused** (owner; not in the dev arm list, can be added later) | 2026-11-01 |
+| Candidate with G-F at 52.7% (dev, before the fix turn) | treat as a G-F fail: describe stays label-free | accept `v2-box` + FIX_ROSTER: the fix turn enforces the listed gender | **B** (owner) | 2026-11-02 |
 
 ## Owner decisions on the open points (2026-11-01)
 

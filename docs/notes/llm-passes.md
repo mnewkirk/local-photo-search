@@ -1330,3 +1330,6 @@ Dev 125, qwen3.5-9b, ~2.8 s/photo, 105 photos with a roster. Runs `evals/people-
   in its gender words counted rephrasing).
 - Overlap second call on `v2-id`'s 60 named spans: 54 have no rival; of 6 with one, 4 dropped, 2 kept
   (unjudged; the overlap decision is Step 6, on the fresh set).
+- **Owner, 2026-11-02: candidate accepted** with G-F at 52.7%: the listed gender overrides appearance in
+  about half the spans by instruction alone; FIX_ROSTER enforces the rest. G-D and G-E (owner labels) and
+  the fresh-set run still decide.
