@@ -957,7 +957,7 @@ def cmd_g1_sheet(a):
     from photosearch import people_bind as PB
     variants = a.variants.split(",")
     runs = {v: _load_arm(v) for v in variants}
-    sample = _jload(HERE / "sample.json", {})
+    sample = _jload(HERE / (a.sample or "sample.json"), {})
     sheet = CONFIRM / "sheet"
     sheet.mkdir(parents=True, exist_ok=True)
     judged = _jload(sheet / "saved-labels.json", {})
@@ -1551,6 +1551,9 @@ def cmd_g1v2_derived(a):
     ev = load_evidence()
     base_name = a.base or f"v2-id{a.suffix}"
     base = _jload(G1 / "runs" / f"{base_name}.json", {})
+    sname = base["spec"].get("sample", "sample.json")
+    if sname != "sample.json":
+        bodies_all.update(_jload(HERE / sname.replace(".json", "-bodies.json"), {}).get("photos", {}))
     arm = base["spec"]["variant"]
     handles = G1V2_VARIANTS[arm].get("handles", True)
     runp = G1 / "runs" / f"{base_name}+{a.variant.replace('v2-id-', '')}.json"
@@ -1559,7 +1562,10 @@ def cmd_g1v2_derived(a):
     if run["spec"] != spec:
         sys.exit(f"{runp} was made with {run['spec']}")
     n_new = 0
-    for pid_s, r in sorted(base["preds"].items(), key=lambda kv: int(kv[0])):
+    preds = base["preds"]
+    if a.variant == "v2-id-ovl" and (G1 / "runs" / f"{base_name}+fixroster.json").exists():
+        preds = _load_arm(f"{base_name}+fix")         # the named spans the pipeline would store
+    for pid_s, r in sorted(preds.items(), key=lambda kv: int(kv[0])):
         if pid_s in run["preds"] or "description" not in r or (a.only and pid_s not in a.only.split(",")):
             continue
         pid = int(pid_s)
@@ -1816,6 +1822,22 @@ def cmd_g1v2_report(a):
             res["flip_compliance_pct"] = round(100 * c["flip_compliant"] / c["flip_spans_gendered"], 1)
         out[v] = res
         print(f"== {v} ({a.splits}): " + json.dumps(res, sort_keys=True))
+    for v in a.variants.split(","):
+        ovl = _jload(G1 / "runs" / f"{v.replace('+fix', '')}+ovl.json", {}).get("preds", {})
+        if not ovl:
+            continue
+        oc = Counter()
+        for pid_s, r in ovl.items():
+            if pid_s not in sample or sample[pid_s]["split"] not in a.splits.split(","):
+                continue
+            for o in r.get("ovl", []):
+                vv = verdicts.get(o["key"], {}).get("v")
+                truth = "right" if vv == "right" else ("wrong" if vv else "unjudged")
+                kept = {True: "kept", False: "dropped", None: "no-answer"}[o["kept"]]
+                oc[f"{truth}-{kept}"] += 1
+                oc["with-rival"] += bool(o["rivals"])
+        out.setdefault("overlap", {})[v] = dict(oc)
+        print(f"== overlap ablation on {v}: {dict(oc)}")
     key = _jload(HERE / "g1pair-v2" / "key.json", None)
     votes = _jload(HERE / "g1pair-v2" / "sheet" / "saved-labels.json", {})
     if key and votes:
@@ -1930,6 +1952,7 @@ def main():
     gs = sub.add_parser("g1-sheet")
     gs.add_argument("--variants", required=True)
     gs.add_argument("--splits", default="dev")
+    gs.add_argument("--sample", default="", help="sample file under people-bind/ (default sample.json)")
     gs.add_argument("--checks", default="", help="v2: only spans of these cross-check classes (e.g. omitted)")
     gs.add_argument("--max", type=int, default=0, help="stop after about this many marks")
     gs.add_argument("--named-only", action="store_true",
