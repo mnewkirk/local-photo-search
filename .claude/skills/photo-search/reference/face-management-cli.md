@@ -90,7 +90,15 @@ python scripts/rank_shoot.py --date 2026-09-12 --measure
 # select, preview, then create
 python scripts/rank_shoot.py --date 2026-09-12 [--max-per-person 6]
 python scripts/rank_shoot.py --date 2026-09-12 --max-per-person 6 --apply
+# two games on one date: a time window, one combined album, 1-frame-per-second bursts
+python scripts/rank_shoot.py --date 2026-11-08 --start 15:00 --end 17:00 --burst-gap 0.5 \
+    --label "Soccer Game - 2026-11-08 (3:30pm)" --combined-only --apply
 ```
+
+`date_taken` has 1-second resolution, so any `--burst-gap` below 1 means "one
+frame per second"; drop to 0.5 when the run warns there are too few bursts to fill
+the request. A team photo is not a game: exclude its minute from the window and pick
+it by eye from per-face strips.
 
 **The measurement pass lives in `photosearch/rank_measure.py`, not in the
 script** — the script imports `measure` from there, so there is one
