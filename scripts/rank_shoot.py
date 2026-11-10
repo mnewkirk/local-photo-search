@@ -59,6 +59,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from photosearch.rank_measure import default_cache_path, measure  # noqa: E402
 
 
+# Labelled people who are not players. They don't count toward the per-person
+# floor or the coverage report, and their faces don't drive a frame's score: a
+# crisp coach on the touchline is not a keeper. Extend with --not-player.
+NOT_PLAYERS = ("Justin Tinnel", "Kasey Jones")   # the coaches
+
+
 def log(msg):
     print(msg, flush=True)
 
@@ -156,7 +162,8 @@ def time_bounds(date_, start=None, end=None):
 
 def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
            max_per_person=None, min_aes_coverage=0.80, iso_bands=True,
-           start=None, end=None):
+           start=None, end=None, not_players=NOT_PLAYERS):
+    not_players = set(not_players)
     lo, hi = time_bounds(date_, start, end)
     rows = db.conn.execute(
         """SELECT p.id, p.filename, p.date_taken, p.aesthetic_score, p.aes_overall,
@@ -179,6 +186,8 @@ def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
     for p in photos.values():
         p.update(lap=0.0, edge=0, area=0.0, det=0.0, people=set())
     for fr in face_rows:
+        if fr["person_name"] in not_players:
+            continue
         m = (cache.get(str(fr["photo_id"])) or {}).get(str(fr["face_id"]))
         p = photos[fr["photo_id"]]
         if fr["person_name"]:
@@ -345,6 +354,9 @@ def build_parser():
     ap.add_argument("--no-iso-bands", dest="iso_bands", action="store_false",
                     help="Rank sharpness against the whole shoot (the old "
                          "behaviour) instead of against frames at a similar ISO.")
+    ap.add_argument("--not-player", action="append", default=[], metavar="NAME",
+                    help="Another labelled person who is not a player (repeatable); "
+                         f"always excluded: {', '.join(NOT_PLAYERS)}.")
     ap.add_argument("--label", default=None, help="Collection name prefix.")
     ap.add_argument("--combined-only", action="store_true",
                     help="Create only the 'All N+M' collection, not the two tiers.")
@@ -382,7 +394,8 @@ def main():
             db, args.date, cache, best_n=args.best, next_n=args.next_n,
             min_per_person=args.min_per_person, burst_gap=args.burst_gap,
             max_per_person=args.max_per_person, iso_bands=args.iso_bands,
-            start=args.start, end=args.end)
+            start=args.start, end=args.end,
+            not_players=NOT_PLAYERS + tuple(args.not_player))
 
         def coverage(sel):
             c = defaultdict(int)
