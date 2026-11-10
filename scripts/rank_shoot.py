@@ -146,23 +146,34 @@ def build_bursts(photos, gap_seconds):
     return bursts
 
 
+def time_bounds(date_, start=None, end=None):
+    """`date_taken` bounds for one shoot: the whole day, or `[start, end)` on
+    it (HH:MM) when two games share a date. String bounds, because
+    `date_taken` is stored as 'YYYY-MM-DD HH:MM:SS'."""
+    return (f"{date_} {start or '00:00'}",
+            f"{date_} {end}" if end else f"{date_} 99")
+
+
 def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
-           max_per_person=None, min_aes_coverage=0.80, iso_bands=True):
+           max_per_person=None, min_aes_coverage=0.80, iso_bands=True,
+           start=None, end=None):
+    lo, hi = time_bounds(date_, start, end)
     rows = db.conn.execute(
         """SELECT p.id, p.filename, p.date_taken, p.aesthetic_score, p.aes_overall,
                   p.iso
-             FROM photos p WHERE date(p.date_taken) = ? ORDER BY p.date_taken""",
-        (date_,)).fetchall()
+             FROM photos p WHERE p.date_taken >= ? AND p.date_taken < ?
+            ORDER BY p.date_taken""",
+        (lo, hi)).fetchall()
     photos = {r["id"]: dict(r) for r in rows}
     if not photos:
-        raise SystemExit(f"no photos on {date_}")
+        raise SystemExit(f"no photos in [{lo}, {hi})")
 
     face_rows = db.conn.execute(
         """SELECT f.id AS face_id, f.photo_id, f.det_score, f.person_id,
                   pe.name AS person_name
              FROM faces f JOIN photos p ON p.id = f.photo_id
              LEFT JOIN persons pe ON pe.id = f.person_id
-            WHERE date(p.date_taken) = ?""", (date_,)).fetchall()
+            WHERE p.date_taken >= ? AND p.date_taken < ?""", (lo, hi)).fetchall()
 
     # --- per-photo raw signals, taken from the photo's BEST face -----------
     for p in photos.values():
@@ -231,6 +242,7 @@ def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
     # One representative per burst: the best frame of each press.
     reps = sorted((max(b, key=lambda p: p["score"]) for b in bursts),
                   key=lambda p: -p["score"])
+    burst_of = {p["id"]: k for k, b in enumerate(bursts) for p in b}
 
     # --- fill the Best tier ------------------------------------------------
     # `max_per_person` stops one well-photographed kid owning the album. On
@@ -272,14 +284,24 @@ def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
     # Per-person coverage: swap the weakest picks for the strongest frames of
     # anyone short of `min_per_person`. Applied AFTER ranking — it is a
     # constraint on the set, not a term in the score.
+    # The pool is the person's best frame in each burst, not the burst's
+    # representative: a kid at the edge of a burst whose best frame features
+    # someone else would otherwise never qualify (2026-11-08, 3:30pm game:
+    # four players in 4-5 bursts each were represented by 1 rep apiece).
     everyone = {n for p in scored for n in p["people"]}
     for name in sorted(everyone, key=lambda n: have[n]):
-        pool = [p for p in reps
-                if name in p["people"] and p["id"] not in chosen
+        used = {burst_of[i] for i in chosen}
+        own = {}
+        for p in scored:
+            k = burst_of[p["id"]]
+            if (name in p["people"] and k not in used
+                    and (k not in own or p["score"] > own[k]["score"])):
+                own[k] = p
+        pool = [p for p in sorted(own.values(), key=lambda p: -p["score"])
                 # don't fix one person's shortfall by blowing another's cap
-                and (max_per_person is None
-                     or all(have[o] < max_per_person
-                            for o in p["people"] if o != name))]
+                if max_per_person is None
+                or all(have[o] < max_per_person
+                       for o in p["people"] if o != name)]
         while have[name] < min_per_person and pool:
             add = pool.pop(0)
             # Drop the weakest pick that isn't itself propping someone up.
@@ -293,7 +315,8 @@ def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
                 have[n] -= 1
             _take(add)
     best.sort(key=lambda p: -p["score"])
-    nxt = [p for p in reps if p["id"] not in chosen][:next_n]
+    used = {burst_of[i] for i in chosen}
+    nxt = [p for p in reps if burst_of[p["id"]] not in used][:next_n]
     return best, nxt, scored
 
 
@@ -302,6 +325,11 @@ def build_parser():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB", "photo_index.db"))
     ap.add_argument("--date", required=True, metavar="YYYY-MM-DD")
+    ap.add_argument("--start", metavar="HH:MM", default=None,
+                    help="Only photos taken at or after this time on --date "
+                         "(two games on one day).")
+    ap.add_argument("--end", metavar="HH:MM", default=None,
+                    help="Only photos taken before this time on --date.")
     ap.add_argument("--cache", default=None, help="Sharpness cache JSON.")
     ap.add_argument("--measure", action="store_true",
                     help="Run the native-resolution sharpness pass and exit.")
@@ -318,6 +346,8 @@ def build_parser():
                     help="Rank sharpness against the whole shoot (the old "
                          "behaviour) instead of against frames at a similar ISO.")
     ap.add_argument("--label", default=None, help="Collection name prefix.")
+    ap.add_argument("--combined-only", action="store_true",
+                    help="Create only the 'All N+M' collection, not the two tiers.")
     ap.add_argument("--apply", action="store_true", help="Create the collections.")
     return ap
 
@@ -351,7 +381,8 @@ def main():
         best, nxt, scored = select(
             db, args.date, cache, best_n=args.best, next_n=args.next_n,
             min_per_person=args.min_per_person, burst_gap=args.burst_gap,
-            max_per_person=args.max_per_person, iso_bands=args.iso_bands)
+            max_per_person=args.max_per_person, iso_bands=args.iso_bands,
+            start=args.start, end=args.end)
 
         def coverage(sel):
             c = defaultdict(int)
@@ -375,22 +406,26 @@ def main():
             log("\nDRY RUN — nothing written. Re-run with --apply.")
             return
 
-        label = args.label or f"Soccer Game - {args.date}"
+        when = args.date + (f" {args.start or '00:00'}-{args.end or '24:00'}"
+                            if args.start or args.end else "")
+        label = args.label or f"Soccer Game - {when}"
         made = []
-        for name, sel, desc in (
+        tiers = (
             (f"{label} - Best {len(best)}", best,
-             f"Top {len(best)} from {args.date}, ranked on native-resolution face "
+             f"Top {len(best)} from {when}, ranked on native-resolution face "
              f"sharpness, face size and detection confidence, with at least "
              f"{args.min_per_person} frames of every face-matched person"
              + (f" and at most {args.max_per_person}" if args.max_per_person else "")
              + f", and no two frames from the same burst."),
             (f"{label} - Next {len(nxt)}", nxt,
-             f"Second tier from {args.date}. No overlap with the Best {len(best)} "
+             f"Second tier from {when}. No overlap with the Best {len(best)} "
              f"and no two frames from the same burst. Same ranking."),
             (f"{label} - All {len(best) + len(nxt)}", best + nxt,
-             f"Everything from the two tiers in one album: the full curated set "
-             f"from {args.date}."),
-        ):
+             f"The full curated set from {when}: the Best {len(best)} (at least "
+             f"{args.min_per_person} frames of every face-matched person) plus the "
+             f"Next {len(nxt)} by score, no two frames from the same burst."),
+        )
+        for name, sel, desc in (tiers[-1:] if args.combined_only else tiers):
             cid = db.create_collection(name, desc)
             db.add_photos_to_collection(cid, [p["id"] for p in sel])
             made.append((cid, name, len(sel)))
