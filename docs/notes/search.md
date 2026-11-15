@@ -214,3 +214,13 @@ logs (27 want the person in the foreground, 18 want faces fully in frame), and a
   - 215959's "other" face is a `dedupe_unmatched` duplicate box on Matt.
   - Result: floor 0.25 of the *median* named face, and drop other faces with IoU ≥ 0.5 against a named face.
 - **The Ask side waits for the 32k-context fix.**
+
+### 2026-11-02 — `/api/cameras` hammered the NAS disks; covering camera index
+
+- **Symptom:** NAS I/O pressure peaked at ~13% (5-min average) with CPU idle. Plex, Syncthing, cron and UGOS were all quiet.
+- **Cause:** one `GET /api/cameras` (the camera dropdown on `/collections/40`) took 154.5 s. Its `GROUP BY camera_model`
+  ran on `idx_photos_camera_date (camera_model, date_taken)`, but `MAX(camera_make)` forced a lookup of each of the
+  258,827 photo rows in the 2.7 GB DB: random reads on the RAID with a cold cache. Every page with a camera filter runs it.
+- **Fix:** replaced the index with `idx_photos_camera_date_make (camera_model, date_taken, camera_make)`
+  (old one in `_SUPERSEDED_INDEXES`). The plan is now `USING COVERING INDEX`, so the query never reads `photos`.
+  Camera and camera + date searches keep the same prefix. `tests/test_search_indexes.py` pins both.

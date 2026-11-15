@@ -185,7 +185,7 @@ def test_camera_and_date_use_the_composite_index(lib):
     plans = _plans_touching(db, stmts, "camera_model")
     assert plans
     for plan in plans:
-        assert "idx_photos_camera_date (camera_model=? AND date_taken>" in plan
+        assert "idx_photos_camera_date_make (camera_model=? AND date_taken>" in plan
         assert "SCAN photos" not in plan
 
 
@@ -275,6 +275,14 @@ def test_ingest_hash_lookup_and_map_query_are_indexed(lib):
     web_src = inspect.getsource(web.api_photos_geojson)
     assert all(part.strip() in web_src for part in geojson.split("FROM"))
     assert "COVERING INDEX idx_photos_gps_cover" in _plan(db, geojson)
+
+
+def test_camera_list_reads_only_the_covering_index(lib):
+    # /api/cameras feeds every camera dropdown; a plain (non-covering) index
+    # looked up each photo row for camera_make — 154 s on the NAS.
+    db, _ = lib
+    from photosearch import web
+    assert "COVERING INDEX idx_photos_camera_date_make" in _plan(db, web._CAMERAS_SQL)
 
 
 def test_photo_stack_lookup_still_indexed_after_dropping_duplicates(lib):

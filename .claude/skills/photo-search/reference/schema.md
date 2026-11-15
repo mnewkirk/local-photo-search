@@ -93,7 +93,7 @@ row). The trigger: a camera + two-day search took >120 s on 2026-10-03.
 
 | index | serves |
 |---|---|
-| `idx_photos_camera_date (camera_model, date_taken)` | camera alone, camera + dates |
+| `idx_photos_camera_date_make (camera_model, date_taken, camera_make)` | camera alone, camera + dates; covering for `/api/cameras` (docs/notes/search.md, 2026-11-02) |
 | `idx_photos_file_hash` | ingest dedup (was a full scan per incoming file) |
 | `idx_photos_{visual_tags,categories,keywords} (col, date_taken)` | tag filters scan a 10–25 MB covering index, not the table |
 | `idx_photos_{country,admin1,admin2,locality}_nc (col COLLATE NOCASE)` | structured location (`col = ? COLLATE NOCASE`) |
