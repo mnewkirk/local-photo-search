@@ -179,11 +179,16 @@ services:
       # ./photos/_incoming (the repo dir), which diverged from PHOTO_DIR and
       # left phone uploads invisible to ingest for the same reason.
       - ${PHOTO_DIR}/_incoming:/incoming
+    # Sync on 22001, not 22000: UGOS's Sync & Backup app (`syncspace`, a
+    # Syncthing fork) holds host 22000 + 21027, and whichever starts first wins
+    # the port (UGOS 1.19.1 started it first and this container failed to
+    # start). config.xml listens on :22001 to match. No 21027 mapping: it's
+    # taken, and LAN discovery broadcasts never reached the bridge anyway —
+    # the NAS dials the phones (tcp-client) or meets them via relays.
     ports:
       - "8384:8384"          # web GUI
-      - "22000:22000/tcp"    # sync protocol
-      - "22000:22000/udp"    # sync protocol (QUIC)
-      - "21027:21027/udp"    # LAN discovery
+      - "22001:22001/tcp"    # sync protocol
+      - "22001:22001/udp"    # sync protocol (QUIC)
 
   # NOTE: the photosearch-tailscale sidecar was removed 2026-07-03. It ran in
   # this compose's network namespace (network_mode: service:photosearch), so it
