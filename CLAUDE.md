@@ -59,6 +59,8 @@ Copied from the rule files above; those stay the source of truth.
 - **SD importer**: never `--no-index` (moved files become unclaimable, unsearchable and invisible to hash dedup); use `--no-clip` to register rows and leave CLIP to the fleet.
 - **Restarting photosearch**: never `docker compose up` it from inside its own container (it strands the new container in Created state); `POST /api/admin/restart` launches the detached restart helper. Git on the NAS needs per-call `-c safe.directory=...` (see NAS Docker Commands).
 
+- **Something broken?** Read the newest health incident first: NAS `/volume1/docker/healthwatch/latest-incident/report.md`, desktop `~/.local/state/healthwatch/latest-incident/report.md` (`reference/healthwatch.md`).
+
 History for every trap: `docs/notes/<subsystem>.md`. Runbooks: `.claude/skills/photo-search/reference/`. Plan status: `docs/plans/README.md`.
 
 ## Database

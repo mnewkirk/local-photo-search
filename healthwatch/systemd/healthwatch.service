@@ -1,0 +1,12 @@
+[Unit]
+Description=Photosearch NAS health watcher (one cycle)
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/healthwatch.env
+# UGOS's global GODEBUG=tlskyber=0 kills Go 1.27+ CLIs (tailscale) this calls.
+UnsetEnvironment=GODEBUG
+ExecStart=/usr/bin/python3 /volume1/docker/photosearch/healthwatch/healthwatch.py run --role nas
+TimeoutStartSec=600
+Nice=10

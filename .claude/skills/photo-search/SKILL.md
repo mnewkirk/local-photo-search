@@ -35,6 +35,7 @@ acting** — the detail lives there, not here.
 | API routes | `reference/api-endpoints.md` | every `/api/*` route by area (search, video, faces, batches, geotag, Google, …) |
 | Frontend pages | `reference/frontend-pages.md` | shared.js components, /status, /faces panels, /merges, review/culling |
 | Schema and search performance | `reference/schema.md` | tables, columns, v34 indexes and how search uses them |
+| Something stopped working (NAS, Tailscale, Docker, replica) | `reference/healthwatch.md` | latest incident report, checks + auto-fixes, install, adding a check |
 | "Why was that slow / what was that for?" | `reference/troubleshooting.md` | `request-stats` and the request log |
 | MCP server, Ask agent, local replica | `reference/mcp-ask-replica.md` | M24a/M24b tool layer, locked filters, M26a replica sync |
 | Google Photos upload | `reference/google-photos.md` | scope, upload flow, album ids |

@@ -1,0 +1,8 @@
+[Unit]
+Description=Photosearch desktop health watcher (one cycle)
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/healthwatch.env
+ExecStart=/usr/bin/python3 %h/local-photo-search/healthwatch/healthwatch.py run --role desktop
+TimeoutStartSec=300

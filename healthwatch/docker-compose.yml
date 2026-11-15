@@ -1,0 +1,24 @@
+# Push notifications for healthwatch — its own compose project, so photosearch
+# deploys never touch it:
+#   docker compose -p healthwatch -f healthwatch/docker-compose.yml up -d
+# Phone: ntfy app → add server http://dxp4800-f976:8090 (over Tailscale) →
+# subscribe to the topic in /etc/healthwatch.env (HEALTHWATCH_NTFY_TOPIC).
+services:
+  ntfy:
+    image: binwiederhier/ntfy:v2.11.0
+    container_name: healthwatch-ntfy
+    command: serve
+    restart: unless-stopped
+    environment:
+      - TZ=America/Los_Angeles
+      - NTFY_BASE_URL=http://dxp4800-f976:8090
+      - NTFY_CACHE_FILE=/var/cache/ntfy/cache.db
+      - NTFY_CACHE_DURATION=72h
+    volumes:
+      - /volume1/docker/healthwatch/ntfy-cache:/var/cache/ntfy
+    ports:
+      - "8090:80"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
