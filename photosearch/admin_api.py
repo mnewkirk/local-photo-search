@@ -977,9 +977,12 @@ def admin_restart():
     Native (local-replica) mode re-execs the `cli.py serve` process — see
     `_restart_native`. Docker (NAS) mode does the helper-container swap below.
 
-    Docker path: trigger `docker compose up -d --no-deps photosearch` via a
-    *separate* helper container so the compose process survives this container's
-    death.
+    Docker path: trigger `docker compose up -d --no-deps photosearch
+    photosearch-mcp` via a *separate* helper container so the compose process
+    survives this container's death. The MCP sibling runs the same image, so it
+    rides along: compose recreates each container whose image changed (a fresh
+    build) and leaves it alone otherwise. Restarting only photosearch left the
+    MCP server a build behind whenever nobody clicked Restart MCP.
 
     Why a helper container instead of in-process subprocess: when compose
     SIGKILLs the running photosearch container after stop_grace_period, every
@@ -1039,7 +1042,7 @@ def admin_restart():
             "-w", "/repo",
             "docker:cli",
             "compose", "-p", COMPOSE_PROJECT, "-f", "docker-compose.nas.yml",
-            "up", "-d", "--no-deps", COMPOSE_SERVICE,
+            "up", "-d", "--no-deps", COMPOSE_SERVICE, MCP_SERVICE,
         ]
         try:
             r = subprocess.run(helper_cmd, capture_output=True, text=True, timeout=30)

@@ -12,8 +12,7 @@
 # served zero successful calls in the retained log: its models (llava, moondream,
 # llama3.2:3b) had drifted off every current default, so NAS-side describe
 # (llama3.2-vision) and Ask (llama3.1) both 404'd at the model layer. Its
-# `ollama-models` volume is left on disk — `docker volume rm
-# photosearch_ollama-models` to reclaim ~8.4 GB once you're happy.
+# `ollama-models` volume was removed 2026-11-15.
 #
 # Remote access is via **host-level Tailscale on the NAS** (node DXP4800-F976).
 # The old in-compose `tailscale` sidecar was removed 2026-07-03 — it shared the
@@ -201,7 +200,5 @@ services:
 volumes:
   photosearch-data:
     driver: local
-  # ollama-models intentionally dropped along with the ollama service. Compose
-  # does not delete the underlying volume, so the pulled models survive on disk
-  # until you `docker volume rm photosearch_ollama-models` — re-adding the
-  # service would pick them straight back up.
+  # ollama-models intentionally dropped along with the ollama service; the
+  # leftover photosearch_ollama-models volume was removed 2026-11-15.

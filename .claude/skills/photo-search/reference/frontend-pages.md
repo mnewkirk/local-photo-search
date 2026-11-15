@@ -91,8 +91,10 @@ docker run --rm --detach \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v $HOST_REPO_DIR:/repo \
   -w /repo docker:cli \
-  compose -p photosearch -f docker-compose.nas.yml up -d --no-deps photosearch
+  compose -p photosearch -f docker-compose.nas.yml up -d --no-deps photosearch photosearch-mcp
 ```
+
+Restart brings `photosearch-mcp` along (same image), so a Build + Restart updates both; see docs/notes/frontend.md "Restart also recreates the MCP sibling".
 
 The helper has its own PID namespace, so it survives the photosearch
 container's SIGTERM/SIGKILL and reliably reaches the "start new

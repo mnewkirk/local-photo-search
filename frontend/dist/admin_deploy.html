@@ -1038,15 +1038,15 @@
                 ? 're-exec the local replica process to apply pulled code'
                 : (buildResult === 'ready'
                     ? 'New image ready — click to apply it'
-                    : 'docker compose up -d — swap to the new image'),
+                    : 'docker compose up -d photosearch photosearch-mcp — swap both to the new image'),
             }, buildResult === 'ready' ? 'Restart ← new image ready' : 'Restart'),
             !native && e('button', {
               className: 'btn',
               disabled: busy,
               onClick: runRestartMcp,
-              title: 'docker compose up -d --force-recreate photosearch-mcp — recreate the MCP '
-                   + 'container on the current image. No separate build needed: it reuses the '
-                   + 'photosearch image, so just Build then Restart MCP to pick up new code.',
+              title: 'docker compose up -d --force-recreate photosearch-mcp — recreate only the MCP '
+                   + 'container on the current image. Restart already brings MCP along after a '
+                   + 'Build; use this to bounce MCP alone without touching photosearch.',
             }, 'Restart MCP'),
             e('button', {
               className: 'btn',

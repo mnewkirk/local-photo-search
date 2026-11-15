@@ -201,3 +201,15 @@ Checked against the code while writing `.claude/rules/`; the text above is kept 
 - In `PS.PhotoModal`, checking `verify` or `video-describe` also auto-selects `category-content` + `keywords`, not only `describe`.
 - The Workers panel and fleet launcher live on `/admin/maintenance` (`WorkersPanel`) and read `/api/admin/workers/queue-status`, which proxies the NAS's `/api/worker/status` in replica mode. A standalone `/admin/deploy` page also exists.
 - Restart sets each live claim's `expires_at` to now + 15 minutes (it does not add 15 minutes to the old value).
+
+### Restart also recreates the MCP sibling (2026-11-15)
+
+`photosearch-mcp` runs the `photosearch-photosearch` image but is its own
+container, and only the separate Restart MCP button recreated it. The 2026-11-02
+deploy restarted photosearch and skipped that button, so the MCP server ran the
+2026-11-01 build for two weeks unnoticed. The restart helper now runs
+`up -d --no-deps photosearch photosearch-mcp`: compose recreates a container
+whose image changed (verified on Docker 29.6.2 / compose: `up -d --no-deps
+photosearch-mcp` printed Recreated with no `--force-recreate`) and leaves an
+unchanged one alone, so both track the latest build. Restart MCP stays for
+bouncing MCP alone. Test: `test_docker_restart_helper_also_recreates_mcp`.

@@ -73,3 +73,31 @@ def test_native_restart_reexecs_without_killing_runner(client, monkeypatch):
     assert started.get("start_called") is True
     assert started.get("daemon") is True
     assert callable(started.get("target"))
+
+
+def test_docker_restart_helper_also_recreates_mcp(client, monkeypatch, tmp_path):
+    """The docker-mode restart helper must bring up the MCP sibling with the web
+    container, or the MCP server stays a build behind after every deploy."""
+    monkeypatch.setattr(admin_api, "_deploy_mode", lambda: "docker")
+    monkeypatch.setenv("PHOTOSEARCH_DB", str(tmp_path / "restart.db"))
+    calls = []
+
+    class _Done:
+        returncode = 0
+        stdout = "0123456789abcdef\n"
+        stderr = ""
+
+    def _fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _Done()
+
+    monkeypatch.setattr(admin_api.subprocess, "run", _fake_run)
+
+    r = client.post("/api/admin/restart")
+    assert r.status_code == 200
+    assert r.json()["helper_container"] == "0123456789ab"
+    (cmd,) = calls
+    assert cmd[:2] == ["docker", "run"]
+    up = cmd[cmd.index("up"):]
+    assert up == ["up", "-d", "--no-deps",
+                  admin_api.COMPOSE_SERVICE, admin_api.MCP_SERVICE]
