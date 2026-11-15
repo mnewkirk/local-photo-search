@@ -2261,7 +2261,7 @@ def search_combined(
         ranks_per_set.append({r["id"]: i for i, r in enumerate(matched_rows)})
 
     if camera:
-        # idx_photos_camera_date serves camera alone and camera + date range.
+        # idx_photos_camera_date_make serves camera alone and camera + date range.
         sql, params = "SELECT * FROM photos WHERE camera_model = ?", [camera]
         if date_from:
             sql += " AND date_taken >= ? AND date_taken <= ?"

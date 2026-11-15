@@ -129,8 +129,11 @@ SCHEMA_VERSION = 43
 # v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
 # PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
 _SEARCH_INDEXES: list[tuple[str, str]] = [
-    # camera alone and camera + date range (the 2026-10-03 >120 s search)
-    ("idx_photos_camera_date", "photos(camera_model, date_taken)"),
+    # camera alone and camera + date range (the 2026-10-03 >120 s search).
+    # camera_make makes it covering for /api/cameras, which otherwise looked
+    # up every photo row for MAX(camera_make): 154 s on the NAS, 2026-11-02.
+    ("idx_photos_camera_date_make",
+     "photos(camera_model, date_taken, camera_make)"),
     # ingest dedup looked up file_hash with a full scan per incoming file
     ("idx_photos_file_hash", "photos(file_hash)"),
     # JSON tag filters stay a Python membership test, but scan a covering
@@ -326,6 +329,7 @@ _SUPERSEDED_INDEXES = (
     "idx_photos_locality",
     "idx_stack_members_photo", "idx_stack_members_stack",
     "idx_collection_photos_coll",
+    "idx_photos_camera_date",  # → idx_photos_camera_date_make
 )
 
 
